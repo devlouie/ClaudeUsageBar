@@ -56,6 +56,7 @@ jobs:
             dist/*.deb
             dist/*.yml
             dist/*.blockmap
+            !dist/builder-debug.yml
           if-no-files-found: ignore
           retention-days: 14
 
