@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+.env
+
+# Legacy Swift build artifacts (kept under legacy-macos/ for source reference only)
+legacy-macos/.build/
+legacy-macos/ClaudeUsageBar.app/
+legacy-macos/*.dmg
+
+# Editors
+.vscode/
+.idea/
+Thumbs.db

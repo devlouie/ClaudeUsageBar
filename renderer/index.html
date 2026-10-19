@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <title>Claude Usage</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!--
+    UX intent for this redesign:
+    1. Headline = the worst-pressure limit, in giant numbers, with a pace verdict.
+    2. All four limits (Session / Weekly / Fable 7d / Opus 7d) are visible as compact rows -- no Details disclosure for the headline numbers.
+    3. Pace = actual % vs elapsed % shown as a tick on the session bar plus a projected-end glyph.
+    4. Local-log data ("today / week / month tokens") is visually demoted with a tilde and dimmer color to mark it as approximate.
+    5. Model breakdown is a single stacked proportional bar instead of a list of dots.
+    6. Errors when already-loaded are an inline soft strip, not a heavy banner. Loading is a stable skeleton -- no layout jump.
+  -->
+</head>
+<body>
+  <div id="app">
+
+    <!-- ============== EMPTY / FIRST RUN (no creds, never loaded) ============== -->
+    <div id="empty-state" class="state hidden">
+      <div class="emoji-mark">[ ]</div>
+      <h2 class="state-title">No Claude Code session</h2>
+      <p class="state-body" id="empty-text">Sign into Claude Code on this machine, then come back.</p>
+      <div class="row gap8 center">
+        <button class="btn btn-primary" id="empty-retry">Re-check</button>
+      </div>
+      <p class="state-hint muted">Esc to close</p>
+    </div>
+
+    <!-- ============== HARD ERROR (never loaded successfully) ============== -->
+    <div id="error-state" class="state hidden">
+      <div class="emoji-mark warn">!</div>
+      <h2 class="state-title">Can&rsquo;t reach usage data</h2>
+      <p class="state-body" id="error-text"></p>
+      <div class="row gap8 center">
+        <button class="btn btn-primary" id="error-retry">Retry</button>
+        <button class="btn" id="error-reread">Re-read credentials</button>
+      </div>
+      <p class="state-hint muted">Esc to close &middot; &#8984;R to refresh</p>
+    </div>
+
+    <!-- ============== LOADING SKELETON (first load only) ============== -->
+    <div id="loading" class="state-skeleton hidden">
+      <div class="sk-headline">
+        <div class="sk sk-num"></div>
+        <div class="sk sk-line"></div>
+      </div>
+      <div class="sk-rows">
+        <div class="sk sk-row"></div>
+        <div class="sk sk-row"></div>
+        <div class="sk sk-row"></div>
+        <div class="sk sk-row"></div>
+      </div>
+    </div>
+
+    <!-- ============== MAIN CONTENT ============== -->
+    <div id="content" class="hidden">
+
+      <!-- Inline soft strip for stale-data error (only shown if already loaded once) -->
+      <div id="stale" class="stale hidden" role="status"></div>
+
+      <!-- ===== HEADLINE: worst-pressure limit, big ===== -->
+      <section class="headline" id="headline">
+        <div class="headline-top">
+          <span class="headline-label" id="headline-label">Session</span>
+          <span class="headline-tag" id="headline-tag"></span>
+        </div>
+        <div class="headline-num">
+          <span class="headline-pct" id="headline-pct">--</span>
+          <span class="headline-unit">%</span>
+        </div>
+        <div class="headline-verdict" id="headline-verdict">--</div>
+        <div class="headline-bar">
+          <div class="hbar">
+            <div class="hbar-fill" id="headline-bar-fill"></div>
+            <div class="hbar-tick" id="headline-bar-tick" title="Time elapsed in window"></div>
+            <div class="hbar-projected" id="headline-bar-projected" title="Projected end-of-window"></div>
+          </div>
+          <div class="hbar-legend">
+            <span id="headline-elapsed" class="muted">--</span>
+            <span class="spacer"></span>
+            <span id="headline-reset" class="muted">--</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== ALL FOUR LIMITS as compact rows (always visible) ===== -->
+      <section class="limits" aria-label="All limits">
+        <div class="limit-row" id="row-session" data-key="session" role="button" tabindex="0" aria-label="Pin session as headline">
+          <span class="lr-name">Session</span>
+          <div class="lr-bar"><div class="lr-fill" id="bar-session"></div></div>
+          <span class="lr-pct" id="pct-session">--</span>
+        </div>
+        <div class="limit-row" id="row-weekly" data-key="weekly" role="button" tabindex="0" aria-label="Pin weekly as headline">
+          <span class="lr-name">Weekly</span>
+          <div class="lr-bar"><div class="lr-fill" id="bar-weekly"></div></div>
+          <span class="lr-pct" id="pct-weekly">--</span>
+        </div>
+        <div class="limit-row" id="row-fable" data-key="fable" role="button" tabindex="0" aria-label="Pin Fable 7-day as headline">
+          <span class="lr-name">Fable <span class="lr-sub">7d</span></span>
+          <div class="lr-bar"><div class="lr-fill" id="bar-fable"></div></div>
+          <span class="lr-pct" id="pct-fable">--</span>
+        </div>
+        <div class="limit-row" id="row-opus" data-key="opus" role="button" tabindex="0" aria-label="Pin Opus 7-day as headline">
+          <span class="lr-name">Opus <span class="lr-sub">7d</span></span>
+          <div class="lr-bar"><div class="lr-fill" id="bar-opus"></div></div>
+          <span class="lr-pct" id="pct-opus">--</span>
+        </div>
+      </section>
+
+      <!-- ===== LOCAL ACTIVITY (approximate, demoted styling) ===== -->
+      <section class="local" id="local-section">
+        <div class="local-head">
+          <span class="local-title">Activity</span>
+          <span class="local-approx" title="Estimated from local Claude Code logs">~ approx</span>
+        </div>
+        <div class="local-grid">
+          <div class="local-cell">
+            <div class="local-val" id="tok-today">--</div>
+            <div class="local-key">today</div>
+          </div>
+          <div class="local-cell">
+            <div class="local-val" id="tok-week">--</div>
+            <div class="local-key">7d</div>
+          </div>
+          <div class="local-cell">
+            <div class="local-val" id="tok-month">--</div>
+            <div class="local-key">30d</div>
+          </div>
+        </div>
+
+        <div class="burn" id="burn-row">
+          <span class="burn-label">Burn rate</span>
+          <span class="burn-val" id="burn-val">--</span>
+          <span class="spacer"></span>
+          <span class="burn-projected" id="burn-projected"></span>
+        </div>
+
+        <div class="model-bar-wrap" id="model-bar-wrap">
+          <div class="model-bar" id="model-bar"></div>
+          <div class="model-legend" id="model-legend"></div>
+        </div>
+      </section>
+
+      <!-- ===== EXTRA USAGE strip (shown only when enabled) ===== -->
+      <section class="extra hidden" id="extra-section">
+        <span class="extra-label">Extra usage</span>
+        <div class="extra-bar"><div class="extra-fill" id="extra-fill"></div></div>
+        <span class="extra-val" id="extra-val">--</span>
+      </section>
+
+      <!-- ===== FOOTER ===== -->
+      <footer class="footer">
+        <div class="footer-top">
+          <span class="plan" id="plan">--</span>
+          <span class="spacer"></span>
+          <span class="updated muted" id="updated">--</span>
+        </div>
+        <div class="footer-bot">
+          <button class="iconbtn" id="refresh" title="Refresh (R)">
+            <span class="iconbtn-glyph">&#8635;</span>
+            <span class="iconbtn-label">Refresh</span>
+          </button>
+          <span class="spacer"></span>
+          <span class="kbd-hints muted">R refresh &middot; Esc close &middot; Q quit</span>
+          <button class="iconbtn iconbtn-quiet" id="quit" title="Quit (Q)">
+            <span class="iconbtn-glyph">&times;</span>
+          </button>
+        </div>
+      </footer>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

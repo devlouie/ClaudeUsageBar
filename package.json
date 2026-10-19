@@ -1,0 +1,105 @@
+{
+  "name": "claude-usage-bar",
+  "version": "2.1.0",
+  "description": "Claude Code usage in your menu bar or system tray. Session and weekly limits, per-model meters, and live token spend.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "usage",
+    "rate-limit",
+    "token-usage",
+    "menubar",
+    "menu-bar",
+    "system-tray",
+    "tray",
+    "electron",
+    "macos",
+    "windows",
+    "linux",
+    "developer-tools"
+  ],
+  "author": {
+    "name": "devlouie",
+    "url": "https://github.com/devlouie"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/devlouie/ClaudeUsageBar",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devlouie/ClaudeUsageBar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/devlouie/ClaudeUsageBar/issues"
+  },
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "test": "node test/localUsage.test.js"
+  },
+  "devDependencies": {
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "io.github.devlouie.claudeusagebar",
+    "productName": "ClaudeUsageBar",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "src/**"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "devlouie",
+        "repo": "ClaudeUsageBar"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "LSUIElement": true
+      },
+      "icon": "build/icon.png"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "build/icon.png",
+      "maintainer": "devlouie <22274822+devlouie@users.noreply.github.com>"
+    }
+  }
+}

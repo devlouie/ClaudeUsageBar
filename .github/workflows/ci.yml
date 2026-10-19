@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Module load smoke test
+        run: |
+          node -e "require('./src/credentials'); require('./src/api'); require('./src/localUsage'); require('./src/localUsageClient'); require('./src/pricing'); console.log('OK')"
+      - name: Unit tests
+        run: npm test
+      - name: Pack (no publish)
+        run: npm run pack
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
