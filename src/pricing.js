@@ -40,6 +40,12 @@ const DEFAULT_RATES = {
   haiku45:     r(1,     5,     0.10,  1.25,   2),     // Haiku 4.5
   haiku35:     r(0.80,  4,     0.08,  1.0,    1.60),  // Haiku 3.5
   haiku3:      r(0.25,  1.25,  0.03,  0.30,   0.50),  // Haiku 3
+  // Gemini API per-million-token rates (USD)
+  geminiArgon:     r(2.0,   12.0,  0.20,    2.50,    4.0),   // Gemini 4 Argon
+  geminiPro:       r(1.25,  10.0,  0.3125,  1.5625,  2.50),  // Gemini 3.1 / 3 / 2.5 Pro (<= 200K)
+  geminiProLong:   r(2.50,  15.0,  0.625,   3.125,   5.0),   // Gemini Pro (> 200K prompt)
+  geminiFlash:     r(0.15,  0.60,  0.0375,  0.1875,  0.30),  // Gemini 3.x / 2.5 Flash
+  geminiFlashLite: r(0.075, 0.30,  0.01875, 0.09375, 0.15),  // Gemini Flash-Lite
 };
 
 const SONNET_LONG_THRESHOLD = 200_000;
@@ -61,14 +67,27 @@ function loadRates() {
 }
 
 // Model ids can carry a bracketed variant suffix (for example
-// "claude-opus-5-5[1m]"). Strip it so variants price and name like their
-// base model.
+// "claude-opus-5-5[1m]") or parenthesized quality tags ("Gemini 4 Argon (High)").
+// Strip them so variants price and name like their base model.
 function normalize(model) {
-  return (model || '').toLowerCase().replace(/\[[^\]]*\]/g, '');
+  const raw = (model || '')
+    .toLowerCase()
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/\([^)]*\)/g, '')
+    .trim();
+  if (raw === 'model_placeholder_m417') return 'gemini-4-argon';
+  if (raw.startsWith('gemini ')) return raw.replace(/\s+/g, '-');
+  return raw;
 }
 
 function family(model) {
   const m = normalize(model);
+  if (m.startsWith('gemini') || m.includes('gemini-')) {
+    if (m.includes('argon')) return 'gemini-argon';
+    if (m.includes('flash') && m.includes('lite')) return 'gemini-flash-lite';
+    if (m.includes('flash')) return 'gemini-flash';
+    return 'gemini-pro';
+  }
   if (m.includes('fable') || m.includes('mythos')) return 'fable';
   if (m.includes('opus')) return 'opus';
   if (m.includes('haiku')) return 'haiku';
@@ -78,6 +97,15 @@ function family(model) {
 // "5.5", "5", "4.5", "3" or null. Date suffixes are not versions.
 function version(model) {
   const m = normalize(model);
+  if (m.startsWith('gemini') || m.includes('gemini-')) {
+    const gm = m.match(/gemini-(\d+(?:\.\d+)?)(?:-(\d+))?/);
+    if (gm) {
+      if (gm[1].includes('.')) return gm[1];
+      if (gm[2] && gm[2].length < 4) return `${gm[1]}.${gm[2]}`;
+      return gm[1];
+    }
+    return null;
+  }
   const single = m.match(/(fable|mythos)-(\d+)(?:-(\d+))?/);
   if (single) {
     return single[3] && single[3].length < 4 ? `${single[2]}.${single[3]}` : single[2];
@@ -103,6 +131,12 @@ function tier(model, { promptTokens = 0, speed } = {}) {
   const f = family(model);
   const v = versionNumber(model);
   const fast = speed === 'fast';
+  if (f === 'gemini-argon') return 'geminiArgon';
+  if (f === 'gemini-flash-lite') return 'geminiFlashLite';
+  if (f === 'gemini-flash') return 'geminiFlash';
+  if (f === 'gemini-pro') {
+    return promptTokens > SONNET_LONG_THRESHOLD ? 'geminiProLong' : 'geminiPro';
+  }
   if (f === 'fable') return v != null && v >= 5.1 ? 'fable51' : 'fable5';
   if (f === 'opus') {
     if (v == null || v >= 5.5) return fast ? 'opus55Fast' : 'opus55';
@@ -146,11 +180,15 @@ function cost({ model, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, cac
 function displayName(model) {
   const f = family(model);
   const m = normalize(model);
+  const v = version(model);
+  if (f === 'gemini-argon') return v ? `Gemini ${v} Argon` : 'Gemini Argon';
+  if (f === 'gemini-flash-lite') return v ? `Gemini ${v} Flash Lite` : 'Gemini Flash Lite';
+  if (f === 'gemini-flash') return v ? `Gemini ${v} Flash` : 'Gemini Flash';
+  if (f === 'gemini-pro') return v ? `Gemini ${v} Pro` : 'Gemini Pro';
   const base = f === 'fable' ? (m.includes('mythos') ? 'Mythos' : 'Fable')
     : f === 'opus' ? 'Opus'
     : f === 'haiku' ? 'Haiku'
     : 'Sonnet';
-  const v = version(model);
   return v ? `${base} ${v}` : (model || base);
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "claude-usage-bar",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Claude Code usage in your menu bar or system tray. Session and weekly limits, per-model meters, and live token spend.",
   "keywords": [
     "claude",
@@ -40,6 +40,7 @@
     "dist:mac": "electron-builder --mac",
     "dist:win": "electron-builder --win",
     "dist:linux": "electron-builder --linux",
+    "install:local": "electron-builder --dir && (killall ClaudeUsageBar 2>/dev/null || true) && rm -rf \"$HOME/Applications/ClaudeUsageBar.app\" && cp -R dist/mac-arm64/ClaudeUsageBar.app \"$HOME/Applications/ClaudeUsageBar.app\" && codesign --force --deep --sign - \"$HOME/Applications/ClaudeUsageBar.app\" && open -n \"$HOME/Applications/ClaudeUsageBar.app\"",
     "test": "node test/localUsage.test.js"
   },
   "devDependencies": {

@@ -19,8 +19,10 @@ const dir = path.join(TMP, '.claude', 'projects', 'proj');
 fs.mkdirSync(dir, { recursive: true });
 const FILE = path.join(dir, 's.jsonl');
 
-const { parseLocalLogs, resetCache } = require('../src/localUsage');
+const { parseLocalLogs, parseGeminiLocalLogs, resetCache } = require('../src/localUsage');
 const { displayName, tier, cost } = require('../src/pricing');
+const { parseGeminiOAuthPayload } = require('../src/credentials');
+const { snapshotForRenderer, combinedWorstPercent } = require('../src/derivations');
 
 let n = 0;
 function line(model, output, pad = '', usageExtra = {}) {
@@ -190,6 +192,127 @@ function check(name, fn) {
   const oneHour = await parseLocalLogs({});
   check('1h cache writes priced from the TTL breakdown',
     () => assert.ok(near(oneHour.todayCost, 57 / 1_000_000), 'got ' + oneHour.todayCost));
+
+  // --- Gemini pricing & model naming --------------------------------------
+  const geminiNames = {
+    'MODEL_PLACEHOLDER_M417': 'Gemini 4 Argon',
+    'gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+    'gemini-3.8-flash-exp': 'Gemini 3.8 Flash',
+    'gemini-2.5-flash-lite': 'Gemini 2.5 Flash Lite',
+    'gemini-2.5-pro': 'Gemini 2.5 Pro',
+  };
+  for (const [id, want] of Object.entries(geminiNames)) {
+    check('Gemini displayName ' + id, () => assert.strictEqual(displayName(id), want));
+  }
+  check('Gemini tiers resolve pro / long / flash / lite / argon', () => {
+    assert.strictEqual(tier('MODEL_PLACEHOLDER_M417'), 'geminiArgon');
+    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 50_000 }), 'geminiPro');
+    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 250_000 }), 'geminiProLong');
+    assert.strictEqual(tier('gemini-3.8-flash'), 'geminiFlash');
+    assert.strictEqual(tier('gemini-2.5-flash-lite'), 'geminiFlashLite');
+  });
+  check('Gemini 3.1 Pro bills $1.25/M in (<=200k), $2.50/M in (>200k), $10/M out', () => {
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: 100_000 }), 0.125));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: M }), 2.5));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', output: 100_000 }), 1.0));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', cacheRead: 100_000 }), 0.03125));
+  });
+
+  // --- Gemini local log parsing (Antigravity + Gemini CLI) ----------------
+  const agyDir = path.join(TMP, '.gemini', 'antigravity', 'brain', 'conv-1', '.system_generated', 'logs');
+  fs.mkdirSync(agyDir, { recursive: true });
+  const agyTranscript = path.join(agyDir, 'transcript.jsonl');
+  const nowIso = new Date().toISOString();
+  fs.writeFileSync(agyTranscript,
+    JSON.stringify({
+      step_index: 1,
+      type: 'USER_INPUT',
+      created_at: nowIso,
+      content: 'The user changed setting `Model Selection` from Gemini 3 Pro to Gemini 4 Argon.',
+    }) + '\n' +
+    JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      created_at: nowIso,
+      input_tokens: 500,
+      cache_read_tokens: 2000,
+      output_tokens: 300,
+    }) + '\n'
+  );
+
+  const cliChatDir = path.join(TMP, '.gemini', 'tmp', 'proj-hash', 'chats');
+  fs.mkdirSync(cliChatDir, { recursive: true });
+  const cliChatFile = path.join(cliChatDir, 'session-1.jsonl');
+  fs.writeFileSync(cliChatFile,
+    JSON.stringify({
+      id: 'gmsg-1',
+      type: 'gemini',
+      timestamp: nowIso,
+      model: 'gemini-2.5-pro',
+      tokens: { input: 1000, output: 200, cached: 400, thoughts: 50, tool: 50 },
+    }) + '\n'
+  );
+
+  resetCache();
+  const gemLogs = await parseGeminiLocalLogs({});
+  check('parseGeminiLocalLogs aggregates Antigravity + Gemini CLI logs', () => {
+    assert.ok(gemLogs.todayTokens > 1250, 'expected > 1250 tokens, got ' + gemLogs.todayTokens);
+    assert.ok('Gemini 4 Argon' in gemLogs.modelBreakdown, 'expected Gemini 4 Argon in breakdown');
+    assert.ok('Gemini 2.5 Pro' in gemLogs.modelBreakdown, 'expected Gemini 2.5 Pro in breakdown');
+  });
+
+  // --- Gemini credentials & derivations -----------------------------------
+  check('parseGeminiOAuthPayload parses nested tokens and flat payloads', () => {
+    const nested = parseGeminiOAuthPayload(JSON.stringify({
+      tokens: { access_token: 'ya29.test', refresh_token: '1//ref', expires_in: 3600 },
+      client_id: 'cid',
+      client_secret: 'csec',
+    }));
+    assert.strictEqual(nested.accessToken, 'ya29.test');
+    assert.strictEqual(nested.refreshToken, '1//ref');
+
+    const flat = parseGeminiOAuthPayload(JSON.stringify({
+      access_token: 'ya29.flat',
+      refresh_token: '1//flat',
+    }));
+    assert.strictEqual(flat.accessToken, 'ya29.flat');
+  });
+
+  check('snapshotForRenderer computes gemini and combined metrics', () => {
+    const state = {
+      hasLoaded: true,
+      isLoading: false,
+      usage: {
+        five_hour: { utilization: 25, resets_at: new Date(Date.now() + 3600_000).toISOString() },
+        seven_day: { utilization: 40, resets_at: new Date(Date.now() + 86400_000).toISOString() },
+      },
+      geminiHasLoaded: true,
+      geminiUsage: {
+        tierId: 'g1-ultra-tier',
+        tierName: 'Google AI Ultra',
+        five_hour: { utilization: 62, resets_at: new Date(Date.now() + 3600_000).toISOString() },
+        seven_day: { utilization: 15, resets_at: new Date(Date.now() + 86400_000).toISOString() },
+        pro_five_hour: { utilization: 62 },
+        flash_five_hour: { utilization: 10 },
+      },
+      localCosts: first,
+      geminiLocalCosts: gemLogs,
+      lastUpdated: new Date(),
+    };
+    assert.strictEqual(combinedWorstPercent(state), 62);
+    const snap = snapshotForRenderer(state);
+    assert.strictEqual(snap.gemini.sessionPercent, 62);
+    assert.strictEqual(snap.gemini.weeklyPercent, 15);
+    assert.strictEqual(snap.gemini.planName, 'Google AI Ultra');
+    assert.strictEqual(snap.combined.worstPercent, 62);
+    assert.ok(snap.combined.localCosts.monthTokens >= gemLogs.monthTokens);
+    const dayKeys = Object.keys(snap.combined.localCosts.daily || {});
+    assert.ok(dayKeys.length >= 1, 'expected daily buckets in combined.localCosts.daily');
+    const sampleDay = snap.combined.localCosts.daily[dayKeys[0]];
+    assert.ok(sampleDay.tokens > 0 && sampleDay.cost > 0);
+    assert.ok('Gemini 4 Argon' in snap.gemini.localCosts.todayModelBreakdown);
+    assert.ok('Gemini 4 Argon' in snap.gemini.localCosts.todayModelTokens);
+  });
 
   os.homedir = realHome;
   fs.rmSync(TMP, { recursive: true, force: true });

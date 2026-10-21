@@ -46,8 +46,11 @@ async function parseLocalLogsAsync(opts = {}) {
   const id = ++seq;
   const payload = {
     id,
+    provider: opts.provider || 'claude',
     sessionResetAt: opts.sessionResetAt ? opts.sessionResetAt.toISOString() : null,
     weeklyResetAt: opts.weeklyResetAt ? opts.weeklyResetAt.toISOString() : null,
+    geminiSessionResetAt: opts.geminiSessionResetAt ? opts.geminiSessionResetAt.toISOString() : null,
+    geminiWeeklyResetAt: opts.geminiWeeklyResetAt ? opts.geminiWeeklyResetAt.toISOString() : null,
   };
 
   try {
@@ -62,8 +65,22 @@ async function parseLocalLogsAsync(opts = {}) {
   }
 }
 
-function inProcess(opts) {
+async function inProcess(opts) {
   if (!fallback) fallback = require('./localUsage');
+  if (opts.provider === 'both') {
+    const [claude, gemini] = await Promise.all([
+      fallback.parseLocalLogs({
+        sessionResetAt: opts.sessionResetAt || null,
+        weeklyResetAt: opts.weeklyResetAt || null,
+      }),
+      fallback.parseGeminiLocalLogs({
+        sessionResetAt: opts.geminiSessionResetAt || null,
+        weeklyResetAt: opts.geminiWeeklyResetAt || null,
+      }),
+    ]);
+    return { claude, gemini };
+  }
+  if (opts.provider === 'gemini') return fallback.parseGeminiLocalLogs(opts);
   return fallback.parseLocalLogs(opts);
 }
 

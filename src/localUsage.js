@@ -42,10 +42,19 @@ const cursors = new Map();
 // across different session files), so this must live outside the per-file map.
 const seenGlobal = new Map();
 
+// Separate cursor and dedupe maps for Gemini local logs (~/.gemini/antigravity
+// and ~/.gemini/tmp) so Claude and Gemini caches never collide.
+const geminiCursors = new Map();
+const geminiSeenGlobal = new Map();
+const geminiDirCache = new Map();
+
 function resetCache() {
   cursors.clear();
   seenGlobal.clear();
   dirCache.clear();
+  geminiCursors.clear();
+  geminiSeenGlobal.clear();
+  geminiDirCache.clear();
 }
 
 function dayKey(d) {
@@ -63,9 +72,67 @@ function emptySummary() {
     weekTokens: 0, weekCost: 0,
     monthTokens: 0, monthCost: 0,
     modelBreakdown: {},
+    todayModelBreakdown: {},
+    weekModelBreakdown: {},
+    todayModelTokens: {},
+    weekModelTokens: {},
+    monthModelTokens: {},
+    daily: {},
     sessionUsage: zeroBucket(),
     weeklyUsage: zeroBucket(),
   };
+}
+
+function accumulateDayBucket(summary, key, bucket, { todayKey, todayStart, weekStart, monthStartMs }) {
+  const dayMs = dayKeyToMs(key);
+  if (dayMs < monthStartMs) return;
+
+  summary.monthTokens += bucket.tokens;
+  summary.monthCost += bucket.cost;
+
+  let dayEntry = summary.daily[key];
+  if (!dayEntry) {
+    dayEntry = summary.daily[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
+  }
+  dayEntry.tokens += bucket.tokens;
+  dayEntry.cost += bucket.cost;
+
+  for (const [name, c] of Object.entries(bucket.models)) {
+    summary.modelBreakdown[name] = (summary.modelBreakdown[name] || 0) + c;
+    dayEntry.models[name] = (dayEntry.models[name] || 0) + c;
+  }
+  if (bucket.modelTokens) {
+    for (const [name, t] of Object.entries(bucket.modelTokens)) {
+      summary.monthModelTokens[name] = (summary.monthModelTokens[name] || 0) + t;
+      dayEntry.modelTokens[name] = (dayEntry.modelTokens[name] || 0) + t;
+    }
+  }
+
+  if (dayMs >= weekStart) {
+    summary.weekTokens += bucket.tokens;
+    summary.weekCost += bucket.cost;
+    for (const [name, c] of Object.entries(bucket.models)) {
+      summary.weekModelBreakdown[name] = (summary.weekModelBreakdown[name] || 0) + c;
+    }
+    if (bucket.modelTokens) {
+      for (const [name, t] of Object.entries(bucket.modelTokens)) {
+        summary.weekModelTokens[name] = (summary.weekModelTokens[name] || 0) + t;
+      }
+    }
+  }
+
+  if (key === todayKey || dayMs >= todayStart) {
+    summary.todayTokens += bucket.tokens;
+    summary.todayCost += bucket.cost;
+    for (const [name, c] of Object.entries(bucket.models)) {
+      summary.todayModelBreakdown[name] = (summary.todayModelBreakdown[name] || 0) + c;
+    }
+    if (bucket.modelTokens) {
+      for (const [name, t] of Object.entries(bucket.modelTokens)) {
+        summary.todayModelTokens[name] = (summary.todayModelTokens[name] || 0) + t;
+      }
+    }
+  }
 }
 
 function zeroBucket() {
@@ -203,10 +270,11 @@ function ingestLine(line, cur, file, monthStartMs) {
 
   const key = dayKey(ts);
   let bucket = cur.days[key];
-  if (!bucket) bucket = cur.days[key] = { tokens: 0, cost: 0, models: {} };
+  if (!bucket) bucket = cur.days[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
   bucket.tokens += tokens;
   bucket.cost += lineCost;
   bucket.models[dn] = (bucket.models[dn] || 0) + lineCost;
+  bucket.modelTokens[dn] = (bucket.modelTokens[dn] || 0) + tokens;
 
   // Session/weekly windows are anchored to API-supplied reset times that move
   // independently of calendar days, so keep the raw events to sum over.
@@ -283,24 +351,10 @@ async function parseLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = 
 
   // ---- Re-aggregate from the cached per-file buckets ----
   const todayKey = dayKey(now);
+  const bounds = { todayKey, todayStart, weekStart, monthStartMs };
   for (const cur of cursors.values()) {
     for (const [key, bucket] of Object.entries(cur.days)) {
-      const dayMs = dayKeyToMs(key);
-      if (dayMs < monthStartMs) continue;
-
-      summary.monthTokens += bucket.tokens;
-      summary.monthCost += bucket.cost;
-      for (const [name, c] of Object.entries(bucket.models)) {
-        summary.modelBreakdown[name] = (summary.modelBreakdown[name] || 0) + c;
-      }
-      if (dayMs >= weekStart) {
-        summary.weekTokens += bucket.tokens;
-        summary.weekCost += bucket.cost;
-      }
-      if (key === todayKey || dayMs >= todayStart) {
-        summary.todayTokens += bucket.tokens;
-        summary.todayCost += bucket.cost;
-      }
+      accumulateDayBucket(summary, key, bucket, bounds);
     }
 
     if (sessionWindowStart == null && weeklyWindowStart == null) continue;
@@ -427,4 +481,295 @@ function collectJsonl(root, sinceDate) {
   return out;
 }
 
-module.exports = { parseLocalLogs, bucketTotal, resetCache };
+// ---------------------------------------------------------------------------
+// Gemini Local Log Accounting (Antigravity brain transcripts + Gemini CLI chats)
+// ---------------------------------------------------------------------------
+
+function readDefaultAntigravityModel() {
+  try {
+    const pbtxt = path.join(os.homedir(), '.gemini', 'antigravity', 'antigravity_state.pbtxt');
+    if (fs.existsSync(pbtxt)) {
+      const raw = fs.readFileSync(pbtxt, 'utf8');
+      const m = raw.match(/last_selected_agent_model:\s*([^\s\n]+)/);
+      if (m && m[1]) {
+        if (m[1] === 'MODEL_PLACEHOLDER_M417') return 'gemini-4-argon';
+        return m[1].toLowerCase();
+      }
+    }
+  } catch {}
+  return 'gemini-4-argon';
+}
+
+function recordGeminiUsageEvent(cur, file, { id, tsRaw, model, input, output, cacheRead, cacheWrite = 0 }, monthStartMs) {
+  if (id) {
+    const owner = geminiSeenGlobal.get(id);
+    if (owner !== undefined && owner !== file) return;
+    if (cur.seen.has(id)) return;
+    cur.seen.add(id);
+    geminiSeenGlobal.set(id, file);
+  }
+
+  if (!tsRaw) return;
+  const ts = new Date(tsRaw);
+  const tsMs = ts.getTime();
+  if (Number.isNaN(tsMs) || tsMs < monthStartMs) return;
+
+  const lineCost = cost({ model, input, output, cacheRead, cacheWrite });
+  const tokens = input + output + cacheRead + cacheWrite;
+  if (tokens <= 0) return;
+  const dn = displayName(model);
+
+  const key = dayKey(ts);
+  let bucket = cur.days[key];
+  if (!bucket) bucket = cur.days[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
+  bucket.tokens += tokens;
+  bucket.cost += lineCost;
+  bucket.models[dn] = (bucket.models[dn] || 0) + lineCost;
+  bucket.modelTokens[dn] = (bucket.modelTokens[dn] || 0) + tokens;
+
+  const evt = { ts: tsMs, input, output, cacheRead, cacheWrite };
+  const last = cur.events[cur.events.length - 1];
+  if (last && last.ts > tsMs) {
+    cur.events.splice(lowerBound(cur.events, tsMs), 0, evt);
+  } else {
+    cur.events.push(evt);
+  }
+}
+
+function ingestGeminiLine(line, cur, file, monthStartMs, defaultModel) {
+  if (!line) return;
+
+  // 1. Track Antigravity model selection changes inside USER_INPUT steps
+  if (line.indexOf('Model Selection') !== -1 && line.indexOf('"USER_INPUT"') !== -1) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === 'USER_INPUT' && typeof obj.content === 'string') {
+        const m = obj.content.match(/changed setting `Model Selection` from [^\n]+? to ([^.\n]+)/);
+        if (m && m[1]) cur.activeModel = m[1].trim();
+      }
+    } catch {}
+    return;
+  }
+
+  // 2. Antigravity PLANNER_RESPONSE steps carry input_tokens, cache_read_tokens, output_tokens
+  if (line.indexOf('"PLANNER_RESPONSE"') !== -1 && line.indexOf('"input_tokens"') !== -1) {
+    let obj;
+    try { obj = JSON.parse(line); }
+    catch { return; }
+    if (obj.type !== 'PLANNER_RESPONSE') return;
+
+    const input = Number(obj.input_tokens) || 0;
+    const cacheRead = Number(obj.cache_read_tokens) || 0;
+    const output = Number(obj.output_tokens) || 0;
+    const model = obj.model || cur.activeModel || defaultModel;
+    const id = `agy:${file}:${obj.step_index ?? obj.created_at}`;
+
+    recordGeminiUsageEvent(cur, file, {
+      id,
+      tsRaw: obj.created_at || obj.timestamp,
+      model,
+      input,
+      output,
+      cacheRead,
+    }, monthStartMs);
+    return;
+  }
+
+  // 3. Gemini CLI .jsonl chat lines carry { type: "gemini", model, tokens: { input, output, cached, thoughts } }
+  if (line.indexOf('"gemini"') !== -1 && line.indexOf('"tokens"') !== -1) {
+    let obj;
+    try { obj = JSON.parse(line); }
+    catch { return; }
+    if (obj.type !== 'gemini' || !obj.tokens || typeof obj.tokens !== 'object') return;
+
+    const cacheRead = Number(obj.tokens.cached) || 0;
+    const rawInput = Number(obj.tokens.input) || 0;
+    const input = Math.max(0, rawInput - cacheRead);
+    const output = (Number(obj.tokens.output) || 0) + (Number(obj.tokens.thoughts) || 0);
+    const model = obj.model || 'gemini-2.5-pro';
+    const id = obj.id ? `gcli:${obj.id}` : `gcli:${file}:${obj.timestamp}`;
+
+    recordGeminiUsageEvent(cur, file, {
+      id,
+      tsRaw: obj.timestamp || obj.created_at,
+      model,
+      input,
+      output,
+      cacheRead,
+    }, monthStartMs);
+  }
+}
+
+function ingestGeminiJsonFile(file, cur, monthStartMs) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch { return; }
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { return; }
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  for (const msg of messages) {
+    if (!msg || msg.type !== 'gemini' || !msg.tokens || typeof msg.tokens !== 'object') continue;
+    const cacheRead = Number(msg.tokens.cached) || 0;
+    const rawInput = Number(msg.tokens.input) || 0;
+    const input = Math.max(0, rawInput - cacheRead);
+    const output = (Number(msg.tokens.output) || 0) + (Number(msg.tokens.thoughts) || 0);
+    const model = msg.model || 'gemini-2.5-pro';
+    const id = msg.id ? `gcli:${msg.id}` : `gcli:${file}:${msg.timestamp}`;
+    recordGeminiUsageEvent(cur, file, {
+      id,
+      tsRaw: msg.timestamp || data.lastUpdated || data.startTime,
+      model,
+      input,
+      output,
+      cacheRead,
+    }, monthStartMs);
+  }
+}
+
+function collectGeminiLogFiles(sinceDate) {
+  const out = [];
+  const sinceMs = sinceDate.getTime();
+  const home = os.homedir();
+
+  // 1. Antigravity brain transcripts: ~/.gemini/antigravity/brain/<convId>/.system_generated/logs/transcript.jsonl
+  const brainDir = path.join(home, '.gemini', 'antigravity', 'brain');
+  if (safeIsDir(brainDir)) {
+    let convDirs = [];
+    try { convDirs = fs.readdirSync(brainDir, { withFileTypes: true }); }
+    catch {}
+    for (const d of convDirs) {
+      if (!d.isDirectory() || d.name.startsWith('.')) continue;
+      const transcript = path.join(brainDir, d.name, '.system_generated', 'logs', 'transcript.jsonl');
+      const known = geminiCursors.get(transcript);
+      try {
+        const st = fs.statSync(transcript);
+        if (st.isFile() && (known || st.mtimeMs >= sinceMs)) {
+          out.push({ file: transcript, size: st.size, ino: st.ino, format: 'jsonl' });
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Gemini CLI session logs: ~/.gemini/tmp/<project>/chats/*.jsonl and *.json
+  const tmpDir = path.join(home, '.gemini', 'tmp');
+  if (safeIsDir(tmpDir)) {
+    let projDirs = [];
+    try { projDirs = fs.readdirSync(tmpDir, { withFileTypes: true }); }
+    catch {}
+    for (const p of projDirs) {
+      if (!p.isDirectory() || p.name.startsWith('.')) continue;
+      const chatsDir = path.join(tmpDir, p.name, 'chats');
+      if (!safeIsDir(chatsDir)) continue;
+      const stack = [chatsDir];
+      while (stack.length) {
+        const curDir = stack.pop();
+        let entries = [];
+        try { entries = fs.readdirSync(curDir, { withFileTypes: true }); }
+        catch { continue; }
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;
+          const full = path.join(curDir, e.name);
+          if (e.isDirectory()) {
+            stack.push(full);
+          } else if (e.isFile() && (e.name.endsWith('.jsonl') || e.name.endsWith('.json'))) {
+            const known = geminiCursors.get(full);
+            try {
+              const st = fs.statSync(full);
+              if (known || st.mtimeMs >= sinceMs) {
+                out.push({
+                  file: full,
+                  size: st.size,
+                  ino: st.ino,
+                  format: e.name.endsWith('.json') ? 'json' : 'jsonl',
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+async function parseGeminiLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = {}) {
+  const summary = emptySummary();
+  const now = new Date();
+  const todayStart = startOfDay(now).getTime();
+  const weekStart = startOfWeek(now).getTime();
+  const monthStart = startOfMonth(now);
+  const monthStartMs = monthStart.getTime();
+
+  const sessionWindowStart = sessionResetAt
+    ? sessionResetAt.getTime() - 5 * 3600 * 1000
+    : now.getTime() - 5 * 3600 * 1000;
+  const weeklyWindowStart = weeklyResetAt
+    ? weeklyResetAt.getTime() - 7 * 24 * 3600 * 1000
+    : now.getTime() - 7 * 24 * 3600 * 1000;
+
+  const defaultModel = readDefaultAntigravityModel();
+  const files = collectGeminiLogFiles(monthStart);
+  const live = new Set();
+
+  for (const { file, size, ino, format } of files) {
+    live.add(file);
+    let cur = geminiCursors.get(file);
+
+    if (cur && (size < cur.offset || (ino && cur.inode && ino !== cur.inode))) {
+      for (const id of cur.seen) geminiSeenGlobal.delete(id);
+      cur = undefined;
+    }
+    if (!cur) {
+      cur = { offset: 0, inode: ino, days: {}, events: [], seen: new Set(), activeModel: defaultModel };
+      geminiCursors.set(file, cur);
+    }
+
+    if (size > cur.offset) {
+      if (format === 'json') {
+        ingestGeminiJsonFile(file, cur, monthStartMs);
+        cur.offset = size;
+      } else {
+        try {
+          cur.offset = readNewLines(file, cur.offset, size, (line) => {
+            ingestGeminiLine(line, cur, file, monthStartMs, defaultModel);
+          });
+        } catch {}
+      }
+    }
+
+    pruneOld(cur, monthStartMs);
+  }
+
+  for (const [file, cur] of geminiCursors) {
+    if (live.has(file)) continue;
+    for (const id of cur.seen) geminiSeenGlobal.delete(id);
+    geminiCursors.delete(file);
+  }
+
+  const todayKey = dayKey(now);
+  const bounds = { todayKey, todayStart, weekStart, monthStartMs };
+  for (const cur of geminiCursors.values()) {
+    for (const [key, bucket] of Object.entries(cur.days)) {
+      accumulateDayBucket(summary, key, bucket, bounds);
+    }
+
+    if (sessionWindowStart != null) {
+      for (let i = lowerBound(cur.events, sessionWindowStart); i < cur.events.length; i++) {
+        const e = cur.events[i];
+        addBucket(summary.sessionUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
+      }
+    }
+    if (weeklyWindowStart != null) {
+      for (let i = lowerBound(cur.events, weeklyWindowStart); i < cur.events.length; i++) {
+        const e = cur.events[i];
+        addBucket(summary.weeklyUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
+      }
+    }
+  }
+
+  return summary;
+}
+
+module.exports = { parseLocalLogs, parseGeminiLocalLogs, bucketTotal, resetCache };

@@ -24,7 +24,7 @@ jobs:
       - run: npm ci
       - name: Module load smoke test
         run: |
-          node -e "require('./src/credentials'); require('./src/api'); require('./src/localUsage'); require('./src/localUsageClient'); require('./src/pricing'); console.log('OK')"
+          node -e "require('./src/credentials'); require('./src/api'); require('./src/derivations'); require('./src/localUsage'); require('./src/localUsageClient'); require('./src/pricing'); console.log('OK')"
       - name: Unit tests
         run: npm test
       - name: Pack (no publish)

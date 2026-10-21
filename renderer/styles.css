@@ -71,6 +71,76 @@ html, body {
 .row.gap8 { gap: 8px; }
 .row.center { justify-content: center; }
 
+#main-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+/* =================== PROVIDER SWITCHER HEADER =================== */
+
+.provider-header {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface);
+}
+
+.provider-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-2);
+  border-radius: 8px;
+}
+
+.provider-tab {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  min-block-size: 26px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.provider-tab:hover {
+  color: var(--fg-2);
+  background: var(--hover);
+}
+
+.provider-tab.active {
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+
+.pt-badge {
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.provider-tab.active .pt-badge {
+  color: var(--fg-2);
+}
+
+.pt-badge.badge-med  { color: var(--orange); background: var(--orange-soft); }
+.pt-badge.badge-high { color: var(--red);    background: var(--red-soft); }
+
 /* =================== HEADLINE =================== */
 
 .headline {
@@ -229,10 +299,11 @@ html, body {
 
 .limit-row {
   display: grid;
-  grid-template-columns: 64px 1fr 38px;
+  grid-template-columns: 76px 1fr 38px;
   align-items: center;
   gap: 10px;
   font-size: 12px;
+  min-block-size: 24px;
   padding: 4px 0;
   cursor: pointer;
   border-radius: 4px;
@@ -290,7 +361,8 @@ html, body {
 }
 .local-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  gap: 6px;
   margin-bottom: 6px;
 }
 .local-title {
@@ -300,11 +372,61 @@ html, body {
   color: var(--muted);
   font-weight: 600;
 }
+.day-chip {
+  appearance: none;
+  border: 1px solid var(--blue);
+  background: rgba(10, 132, 255, 0.14);
+  color: var(--blue);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 6px;
+  border-radius: 999px;
+  cursor: pointer;
+  min-block-size: 20px;
+}
+.day-chip:hover {
+  background: rgba(10, 132, 255, 0.24);
+}
 .local-approx {
   margin-left: auto;
   font-size: 10px;
   color: var(--muted-2);
   font-style: italic;
+  font-variant-numeric: tabular-nums;
+}
+.metric-switch {
+  display: inline-flex;
+  background: var(--surface);
+  border-radius: 5px;
+  padding: 1px;
+  gap: 1px;
+}
+.metric-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  min-block-size: 20px;
+  min-inline-size: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.metric-btn:hover { color: var(--fg-2); }
+.metric-btn.active {
+  background: var(--surface-2);
+  color: var(--fg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+.metric-btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -1px;
 }
 .local-grid {
   display: grid;
@@ -313,25 +435,152 @@ html, body {
   margin-bottom: 8px;
 }
 .local-cell {
+  appearance: none;
+  border: 1px solid transparent;
   background: var(--surface);
   border-radius: var(--radius-sm);
   padding: 6px 8px;
   text-align: left;
+  font: inherit;
+  cursor: pointer;
+  min-block-size: 24px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.local-cell:hover {
+  background: var(--surface-hover);
+}
+.local-cell.active {
+  border-color: var(--blue);
+  background: rgba(10, 132, 255, 0.10);
+}
+.local-cell:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -1px;
 }
 .local-val {
   font-size: 13px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--fg-2);
+  line-height: 1.15;
+}
+.local-cell.active .local-val {
+  color: var(--fg);
+}
+.local-sub {
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  margin-top: 2px;
   line-height: 1.1;
 }
 .local-key {
-  font-size: 10px;
-  color: var(--muted);
-  margin-top: 2px;
+  font-size: 9.5px;
+  color: var(--muted-2);
+  margin-top: 3px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  font-weight: 600;
 }
+.local-cell.active .local-key {
+  color: var(--blue);
+}
+
+/* Daily price / usage comparison chart */
+.daily-cmp {
+  margin-bottom: 8px;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  padding: 7px 8px 6px;
+}
+.daily-cmp.empty { display: none; }
+.daily-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 44px;
+}
+.day-col {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 2px 1px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  cursor: pointer;
+  border-radius: 4px;
+  font: inherit;
+}
+.day-col:hover {
+  background: var(--surface-hover);
+}
+.day-col.active {
+  background: rgba(10, 132, 255, 0.14);
+  box-shadow: inset 0 0 0 1px var(--blue);
+}
+.day-col:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -1px;
+}
+.day-bar-track {
+  width: 100%;
+  max-width: 18px;
+  flex: 1;
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-start;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--bar-bg-2);
+}
+.day-seg {
+  width: 100%;
+  transition: height 0.25s ease;
+}
+.day-lbl {
+  font-size: 8.5px;
+  line-height: 1;
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.day-col.active .day-lbl,
+.day-col:hover .day-lbl {
+  color: var(--fg);
+  font-weight: 600;
+}
+.daily-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 5px;
+  padding-top: 4px;
+  border-top: 1px solid var(--divider);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.daily-meta-left {
+  color: var(--fg-2);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.daily-meta-right {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.daily-delta.up { color: var(--orange); }
+.daily-delta.down { color: var(--green); }
 
 .burn {
   display: flex;
@@ -589,6 +838,7 @@ html, body {
    focus stays invisible because :focus-visible only matches when the UA
    thinks focus came from the keyboard. */
 .limit-row:focus-visible,
+.provider-tab:focus-visible,
 button:focus-visible,
 .iconbtn:focus-visible {
   outline: 2px solid var(--accent);

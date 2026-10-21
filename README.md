@@ -5,8 +5,8 @@
 <h1 align="center">ClaudeUsageBar</h1>
 
 <p align="center">
-  Claude Code usage in your menu bar or system tray.<br>
-  Session and weekly limits, per-model meters, and live token spend. macOS, Windows, and Linux.
+  Claude Code &amp; Gemini usage in your menu bar or system tray.<br>
+  Session and weekly limits, per-model meters, daily price/token comparison filtering, and live spend across Claude and Gemini. macOS, Windows, and Linux.
 </p>
 
 <p align="center">
@@ -25,17 +25,21 @@
 
 ## Why
 
-Claude Code has a 5-hour session limit and a weekly limit. Some models carry their own weekly meter on top. To see where you stand you open a terminal and type `/usage`, or you hit the wall mid-task. ClaudeUsageBar puts the numbers one glance away and tells you whether your current pace runs out before the window resets.
+Claude Code and Gemini (Code Assist / Antigravity / Gemini CLI) enforce 5-hour session limits, weekly limits, and per-model quotas. To see where you stand you normally open a terminal or IDE settings—or hit the wall mid-task. ClaudeUsageBar puts both providers one glance away in your menu bar (`C 11% · G 9%`) and tells you whether your current pace runs out before the window resets.
 
 ## What you get
 
-- **A tray icon that fills as you approach your limit.** Five LED segments. On macOS the percentage sits beside it in the menu bar.
+- **A tray icon that fills as you approach your limit.** Five LED segments reflecting the highest-pressure window across providers. On macOS both percentages (`C <pct>% · G <pct>%`) sit beside it in the menu bar.
+- **Provider switcher tabs.** Switch between **Claude**, **Gemini**, and **Combined** views (or press `1`, `2`, `3`), each with live utilization badges.
 - **One headline number.** The popup leads with whichever limit is under the most pressure, in big type, with a pace verdict: fresh, on pace, fast, or burning.
-- **Every limit as a row.** Session, weekly, and per-model weekly meters such as Fable and Opus. Click a row to pin it as the headline.
+- **Every limit as a row.** Claude Session, Weekly, Fable 7d, and Opus 7d; Gemini Session 5h, Weekly 7d, Pro 5h, and Flash 5h; or side-by-side Claude & Gemini 5h/7d in Combined view. Click any row to pin it as the headline.
 - **Pace projection.** A tick marks how much of the window has elapsed. A second marker shows where you land at reset if you keep going.
-- **Live token spend.** Today, 7 days, and 30 days, parsed from your local Claude Code transcripts. A burn rate in tokens per minute. A stacked bar of spend by model, priced from the current Anthropic rate card.
-- **Extra usage.** If pay-as-you-go extra usage is on, the popup shows credits used against the monthly cap.
-- **Plan and reset times.** Your plan tier and the time until each window resets.
+- **Interactive daily price & usage comparison filtering.**
+  - Filter local activity by clicking **TODAY**, **7D**, or **30D** cards—each showing both estimated dollar spend (`$`) and token volume (`~M`/`K`).
+  - Toggle the comparison metric between **$** (estimated price) and **Tok** (token volume).
+  - Inspect the stacked **7-day / 14-day daily comparison bar chart** to compare day-over-day spend, `%` delta against the 7-day daily average, or Claude vs. Gemini daily split (`C $... · G $...`). Click any day bar to pin that specific date and filter the model breakdown below to that day.
+- **Extra usage & credits.** Shows Anthropic pay-as-you-go extra usage, Google One AI credits, 3P partner quota, or Gemini API key spend when active.
+- **Plan and reset times.** Your subscription tier (`Max 20x`, `Google AI Ultra`, `Google AI Pro`, etc.) and the time until each window resets.
 
 ## Install
 
@@ -49,35 +53,35 @@ Download the latest build from the [releases page](https://github.com/devlouie/C
 
 Builds are unsigned. On macOS first launch, right-click the app, choose Open, then Open again. On Windows, click "More info", then "Run anyway".
 
-You need [Claude Code](https://docs.anthropic.com/en/docs/claude-code) signed in on the same machine. The app reads the token Claude Code already stores. There is nothing to configure.
+You need [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or Gemini (Antigravity or Gemini CLI) signed in on the same machine. The app reads the tokens those tools already store. There is nothing to configure.
 
 ## How it works
 
-- **Limits** come from the same usage endpoint Claude Code calls, with your existing token. The app polls every 90 seconds while the popup is open and every 5 minutes while it is hidden. It backs off on errors and honours Retry-After.
-- **Spend** comes from the JSONL transcripts in `~/.claude/projects`. The parser is incremental. It keeps a byte cursor per file and reads only the new tail. It splits on raw newline bytes so multi-byte characters never corrupt the offset. It de-duplicates messages that Claude Code re-emits under several parent chains. A 300 MB corpus refreshes in about 2 ms after the first pass. The walk runs in a worker thread.
-- **Prices** live in [`src/pricing.js`](src/pricing.js) with the date they were last checked against the [Anthropic price list](https://platform.claude.com/docs/en/about-claude/pricing). The table covers cache reads, 5-minute and 1-hour cache writes, the Haiku 5.5 prompt-length tiers, and Opus fast mode. To override, point `CLAUDE_USAGE_PRICING_JSON` at a JSON file with the same shape.
+- **Limits** come from the same usage endpoints Claude Code (`api.anthropic.com`) and Gemini / Antigravity (`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`) call, with your existing OAuth tokens. The app polls every 90 seconds while the popup is open and every 5 minutes while it is hidden. It backs off on errors and honours Retry-After.
+- **Spend** comes from the JSONL transcripts in `~/.claude/projects` (Claude Code), `~/.gemini/antigravity/brain/**/.system_generated/logs/transcript.jsonl` (Antigravity), and `~/.gemini/tmp/**/chats` (Gemini CLI). The parser is incremental. It keeps a byte cursor per file, buckets usage by local calendar day (`YYYY-MM-DD`) and model, and reads only the new tail. It splits on raw newline bytes so multi-byte characters never corrupt the offset, and de-duplicates re-emitted message IDs. A 300 MB corpus refreshes in about 2 ms after the first pass. The walk runs in a worker process.
+- **Prices** live in [`src/pricing.js`](src/pricing.js) covering Anthropic (Fable/Mythos, Opus, Sonnet, Haiku, cache TTLs, fast mode) and Gemini (Gemini 4 Argon, Gemini 3.1/2.5 Pro, Flash, Flash Lite, and long-context tiers). To override, point `CLAUDE_USAGE_PRICING_JSON` at a JSON file with the same shape.
 
-Local spend numbers are estimates. They are shown with a tilde and dimmer styling so you do not confuse them with the limits Anthropic reports.
+Local spend numbers are estimates. They are shown with a tilde and dimmer styling so you do not confuse them with the limits Anthropic and Google report.
 
 ## Privacy
 
 | Data | Where it goes |
 |---|---|
-| OAuth token | Read from your existing Claude Code credentials. Never copied off your machine. |
+| OAuth tokens & API keys | Read from your existing local Claude Code and Gemini credentials. Never copied off your machine. |
 | Token and cost totals | Computed locally from your transcripts. Never sent anywhere. |
-| Usage request | Sent to `api.anthropic.com` with your existing token. It is the same call Claude Code makes. |
+| Usage requests | Sent directly to `api.anthropic.com` and `cloudcode-pa.googleapis.com` / `generativelanguage.googleapis.com` with your existing credentials. |
 
 No telemetry. No analytics. No third-party network calls.
 
 ### Where credentials are read from
 
-| OS | Source |
-|---|---|
-| macOS | Keychain item `Claude Code-credentials`, via `/usr/bin/security` |
-| Linux | `~/.claude/.credentials.json`, with fallbacks under `~/.config/claude/` |
-| Windows | `%USERPROFILE%\.claude\.credentials.json`, with fallbacks under `%APPDATA%\claude\` |
+| Provider | OS | Source |
+|---|---|---|
+| Claude Code | macOS | Keychain item `Claude Code-credentials`, via `/usr/bin/security` |
+| Claude Code | Linux / Windows | `~/.claude/.credentials.json`, with fallbacks under `~/.config/claude/` and `%APPDATA%\claude\` |
+| Gemini / Antigravity | macOS / Linux / Windows | `~/.gemini/jetski-standalone-oauth-token`, `~/.gemini/oauth_creds.json`, macOS Keychain `gemini-cli-oauth`, and optional `GEMINI_API_KEY` / `GOOGLE_API_KEY` (`~/.gemini/.env`, `~/.gemini/api_key`, Keychain `gemini-cli-api-key`) |
 
-If no credentials are found the popup says so. Sign into Claude Code, then click **Re-check**. macOS may ask once for keychain access. Click **Always Allow**.
+If no credentials are found the popup says so. Sign into Claude Code or Gemini CLI / Antigravity, then click **Re-check**. macOS may ask once for keychain access. Click **Always Allow**.
 
 ## Run from source
 
@@ -93,9 +97,10 @@ npm start
 ## Build installers
 
 ```bash
-npm run dist:mac     # dist/*.dmg and *.zip
-npm run dist:win     # dist/*.exe
-npm run dist:linux   # dist/*.AppImage and *.deb
+npm run install:local # Build, ad-hoc sign, install to ~/Applications/ClaudeUsageBar.app, and launch (macOS)
+npm run dist:mac      # dist/*.dmg and *.zip
+npm run dist:win      # dist/*.exe
+npm run dist:linux    # dist/*.AppImage and *.deb
 ```
 
 Build on the OS you are targeting, or push a `v*` tag and let the release workflow build all three.

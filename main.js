@@ -1,14 +1,24 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, screen, shell, powerMonitor } = require('electron');
 const path = require('path');
 
-const { readCredentials, REASON } = require('./src/credentials');
-const { snapshotForRenderer, sessionPercent, weeklyPercent, fablePercent, opusPercent } = require('./src/derivations');
+const { readCredentials, readGeminiCredentials, REASON } = require('./src/credentials');
+const {
+  snapshotForRenderer,
+  sessionPercent,
+  weeklyPercent,
+  fablePercent,
+  opusPercent,
+  geminiSessionPercent,
+  geminiWeeklyPercent,
+  combinedWorstPercent,
+} = require('./src/derivations');
 const { createPoller } = require('./src/poller');
 
 let tray = null;
 let popup = null;
 let iconRenderer = null;
 let cachedToken = null;
+let cachedGeminiCreds = null;
 
 const state = {
   usage: null,
@@ -22,6 +32,13 @@ const state = {
   credentialError: null,
   isLoading: false,
   hasLoaded: false,
+
+  // Gemini subscription + API key + local log telemetry state
+  geminiUsage: null,
+  geminiLocalCosts: null,
+  geminiErrorMessage: null,
+  geminiCredentialError: null,
+  geminiHasLoaded: false,
 };
 
 const CRED_ERROR_COPY = {
@@ -31,6 +48,15 @@ const CRED_ERROR_COPY = {
   [REASON.EXPIRED]:           'Token expired. Open Claude Code to sign in again.',
   [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied. Click “Always Allow” on the prompt.',
   [REASON.PERMISSION_DENIED]: 'Permission denied reading credentials file.',
+};
+
+const GEMINI_CRED_ERROR_COPY = {
+  [REASON.NOT_FOUND]:         'No Gemini credentials found. Sign into Gemini CLI / Antigravity or set GEMINI_API_KEY.',
+  [REASON.UNREADABLE]:        'Gemini credentials file exists but couldn’t be read.',
+  [REASON.MALFORMED]:         'Gemini credentials file is unreadable or corrupt.',
+  [REASON.EXPIRED]:           'Gemini token expired. Open Gemini CLI or Antigravity to sign in again.',
+  [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied for Gemini credentials.',
+  [REASON.PERMISSION_DENIED]: 'Permission denied reading Gemini credentials file.',
 };
 
 function loadCredentials() {
@@ -47,6 +73,18 @@ function loadCredentials() {
   state.errorMessage = CRED_ERROR_COPY[result.reason] || 'Could not read Claude Code credentials.';
 }
 
+function loadGeminiCredentials() {
+  const result = readGeminiCredentials();
+  if (result.ok) {
+    cachedGeminiCreds = result;
+    state.geminiCredentialError = null;
+    return;
+  }
+  cachedGeminiCreds = null;
+  state.geminiCredentialError = { reason: result.reason, pathsTried: result.pathsTried || [] };
+  state.geminiErrorMessage = GEMINI_CRED_ERROR_COPY[result.reason] || 'Could not read Gemini credentials.';
+}
+
 function popupVisible() {
   return !!(popup && !popup.isDestroyed() && popup.isVisible());
 }
@@ -61,7 +99,10 @@ const poller = createPoller({
   state,
   getToken: () => cachedToken,
   setToken: (t) => { cachedToken = t; },
+  getGeminiCreds: () => cachedGeminiCreds,
+  setGeminiCreds: (c) => { cachedGeminiCreds = c; },
   loadCredentials,
+  loadGeminiCredentials,
   pushToWindow,
   refreshTray: () => refreshTray(),
   popupVisible,
@@ -116,7 +157,8 @@ let lastTooltip = null;
 
 async function refreshTray() {
   if (!tray) return;
-  const percent = state.hasLoaded ? sessionPercent(state) : 0;
+  const anyLoaded = state.hasLoaded || state.geminiHasLoaded;
+  const percent = anyLoaded ? combinedWorstPercent(state) : 0;
 
   const key = iconKey(percent);
   if (key !== lastIconKey) {
@@ -129,7 +171,12 @@ async function refreshTray() {
     } catch {}
   }
 
-  const titleText = state.hasLoaded ? `${Math.round(percent)}%` : '--';
+  let titleText = '--';
+  if (anyLoaded) {
+    const cStr = state.hasLoaded ? `${Math.round(sessionPercent(state))}%` : '--';
+    const gStr = state.geminiHasLoaded ? `${Math.round(geminiSessionPercent(state))}%` : '--';
+    titleText = `C ${cStr} · G ${gStr}`;
+  }
   if (process.platform === 'darwin' && typeof tray.setTitle === 'function' && titleText !== lastTitle) {
     tray.setTitle(' ' + titleText);
     lastTitle = titleText;
@@ -142,16 +189,27 @@ async function refreshTray() {
 }
 
 function buildTooltip() {
-  if (!state.hasLoaded) return 'Claude Usage: loading…';
-  const parts = [
-    `Session: ${Math.round(sessionPercent(state))}%`,
-    `Weekly: ${Math.round(weeklyPercent(state))}%`,
-  ];
-  const fable = fablePercent(state);
-  if (fable > 0) parts.push(`Fable (7d): ${Math.round(fable)}%`);
-  const opus = opusPercent(state);
-  if (opus > 0) parts.push(`Opus (7d): ${Math.round(opus)}%`);
-  return 'Claude Usage: ' + parts.join(' · ');
+  if (!state.hasLoaded && !state.geminiHasLoaded) return 'Claude & Gemini Usage: loading…';
+  const lines = [];
+  if (state.hasLoaded) {
+    const cParts = [
+      `Session: ${Math.round(sessionPercent(state))}%`,
+      `Weekly: ${Math.round(weeklyPercent(state))}%`,
+    ];
+    const fable = fablePercent(state);
+    if (fable > 0) cParts.push(`Fable (7d): ${Math.round(fable)}%`);
+    const opus = opusPercent(state);
+    if (opus > 0) cParts.push(`Opus (7d): ${Math.round(opus)}%`);
+    lines.push('Claude: ' + cParts.join(' · '));
+  }
+  if (state.geminiHasLoaded) {
+    const gParts = [
+      `Session: ${Math.round(geminiSessionPercent(state))}%`,
+      `Weekly: ${Math.round(geminiWeeklyPercent(state))}%`,
+    ];
+    lines.push('Gemini: ' + gParts.join(' · '));
+  }
+  return lines.join('\n');
 }
 
 function createPopup() {
@@ -233,6 +291,7 @@ function buildContextMenu() {
     { label: 'Re-read credentials', click: () => poller.refresh({ forceSource: true, manual: true }) },
     { type: 'separator' },
     { label: 'Open Anthropic console', click: () => shell.openExternal('https://console.anthropic.com/') },
+    { label: 'Open Google AI Studio', click: () => shell.openExternal('https://aistudio.google.com/') },
     { type: 'separator' },
     { label: 'Quit', role: 'quit' },
   ]);
@@ -290,6 +349,7 @@ if (!gotSingleInstanceLock) {
     createPopup();
     await setupTray();
     loadCredentials();
+    loadGeminiCredentials();
     await poller.start();
 
     // setTimeout doesn't fire during macOS sleep; force a refresh on wake.

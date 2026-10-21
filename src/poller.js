@@ -12,14 +12,17 @@
 //
 // Manual refreshes can fire before `nextAutoAt` unless `hardLock` is set.
 
-const { fetchUsage } = require('./api');
+const { fetchUsage, fetchGeminiUsage } = require('./api');
 const { parseLocalLogsAsync, stop: stopWorker } = require('./localUsageClient');
 
 function createPoller({
   state,
   getToken,
   setToken,
+  getGeminiCreds = () => null,
+  setGeminiCreds = () => {},
   loadCredentials,
+  loadGeminiCredentials = () => {},
   pushToWindow,
   refreshTray,
   popupVisible,
@@ -29,11 +32,12 @@ function createPoller({
   const API_INTERVAL_VISIBLE = 90 * 1000;
   const API_MIN_GAP_MS       = 45 * 1000;
   const API_MAX_BACKOFF_MS   = 15 * 60 * 1000;
-  const API_FIRST_FETCH_DELAY_MS = 4 * 1000;
+  const API_FIRST_FETCH_DELAY_MS = 400;
 
   let apiTimer = null;
   let localTimer = null;
   let inflight = null;
+  let geminiInflight = null;
   let nextAutoAt = 0;
   let hardLock = false;        // set on 429. Blocks manual too
   let errorStep = 0;
@@ -48,11 +52,27 @@ function createPoller({
       ? new Date(state.usage.five_hour.resets_at) : null;
     const weeklyResetAt = state.usage?.seven_day?.resets_at
       ? new Date(state.usage.seven_day.resets_at) : null;
+    const geminiSessionResetAt = state.geminiUsage?.five_hour?.resets_at
+      ? new Date(state.geminiUsage.five_hour.resets_at) : null;
+    const geminiWeeklyResetAt = state.geminiUsage?.seven_day?.resets_at
+      ? new Date(state.geminiUsage.seven_day.resets_at) : null;
+
     const logs = await parseLocalLogsAsync({
+      provider: 'both',
       sessionResetAt: validDate(sessionResetAt),
       weeklyResetAt: validDate(weeklyResetAt),
+      geminiSessionResetAt: validDate(geminiSessionResetAt),
+      geminiWeeklyResetAt: validDate(geminiWeeklyResetAt),
     });
-    state.localCosts = logs;
+    if (logs && logs.claude && logs.gemini) {
+      state.localCosts = logs.claude;
+      state.geminiLocalCosts = logs.gemini;
+    } else {
+      state.localCosts = logs;
+    }
+    if (state.geminiLocalCosts && state.geminiLocalCosts.monthTokens > 0 && !state.geminiHasLoaded && !getGeminiCreds()?.ok) {
+      state.geminiHasLoaded = true;
+    }
     state.lastUpdated = new Date();
     pushToWindow();
     await refreshTray();
@@ -63,10 +83,15 @@ function createPoller({
     pushToWindow();
 
     if (forceSource || !getToken()) loadCredentials();
-    if (!getToken()) {
-      // loadCredentials() already populated state.errorMessage with the
-      // typed reason-specific copy; just count the failure.
+    if (forceSource || !getGeminiCreds()?.ok) loadGeminiCredentials();
+
+    const hasClaude = Boolean(getToken());
+    const gemCreds = getGeminiCreds();
+    const hasGemini = Boolean(gemCreds && gemCreds.ok);
+
+    if (!hasClaude && !hasGemini) {
       errorStep += 1;
+      await refreshLocal();
       state.isLoading = false;
       pushToWindow();
       await refreshTray();
@@ -86,16 +111,62 @@ function createPoller({
       return;
     }
 
-    if (!inflight) {
+    if (hasClaude && !inflight) {
       inflight = fetchUsage(getToken()).finally(() => { inflight = null; });
     }
-    const [apiResult] = await Promise.all([inflight, refreshLocal()]);
+    if (hasGemini && !geminiInflight) {
+      geminiInflight = fetchGeminiUsage(gemCreds).finally(() => { geminiInflight = null; });
+    }
 
-    handleApiResult(apiResult);
+    const hadResetWindows = Boolean(
+      state.usage?.five_hour?.resets_at && state.geminiUsage?.five_hour?.resets_at
+    );
+
+    const [apiResult, geminiResult] = await Promise.all([
+      hasClaude ? inflight : Promise.resolve(null),
+      hasGemini ? geminiInflight : Promise.resolve(null),
+      refreshLocal(),
+    ]);
+
+    if (apiResult) handleApiResult(apiResult);
+    if (geminiResult) handleGeminiApiResult(geminiResult);
+
+    if (!hadResetWindows && (apiResult?.ok || geminiResult?.ok)) {
+      await refreshLocal();
+    }
 
     state.isLoading = false;
     pushToWindow();
     await refreshTray();
+  }
+
+  function handleGeminiApiResult(geminiResult) {
+    if (geminiResult.refreshedOauth) {
+      const prev = getGeminiCreds();
+      if (prev) setGeminiCreds({ ...prev, oauth: geminiResult.refreshedOauth });
+    }
+    if (geminiResult.ok) {
+      state.geminiUsage = geminiResult.data;
+      state.geminiHasLoaded = true;
+      state.geminiErrorMessage = null;
+      if (!getToken()) onSuccess();
+      return;
+    }
+    if (geminiResult.status === 401 || geminiResult.status === 403) {
+      loadGeminiCredentials();
+      state.geminiErrorMessage = 'Gemini token expired or unauthorized. Sign in again.';
+    } else if (geminiResult.status === 429) {
+      state.geminiErrorMessage = 'Gemini API throttled. Using local data.';
+    } else if (geminiResult.error === 'timeout') {
+      state.geminiErrorMessage = 'Gemini request timed out.';
+    } else if (geminiResult.code === 'ENOTFOUND' || geminiResult.code === 'EAI_AGAIN') {
+      state.geminiErrorMessage = 'Offline';
+    } else {
+      state.geminiErrorMessage = geminiResult.error
+        ? `Gemini API error: ${geminiResult.error}`
+        : `Gemini API error (HTTP ${geminiResult.status ?? '?'})`;
+    }
+    if (!getToken()) onError();
   }
 
   function handleApiResult(apiResult) {

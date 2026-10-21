@@ -6,12 +6,27 @@
 // requests exactly as it would in-process.
 
 const { parentPort } = require('worker_threads');
-const { parseLocalLogs } = require('./localUsage');
+const { parseLocalLogs, parseGeminiLocalLogs } = require('./localUsage');
 
 parentPort.on('message', async (msg) => {
-  const { id, sessionResetAt, weeklyResetAt } = msg;
+  const { id, provider, sessionResetAt, weeklyResetAt, geminiSessionResetAt, geminiWeeklyResetAt } = msg;
   try {
-    const summary = await parseLocalLogs({
+    if (provider === 'both') {
+      const [claude, gemini] = await Promise.all([
+        parseLocalLogs({
+          sessionResetAt: sessionResetAt ? new Date(sessionResetAt) : null,
+          weeklyResetAt: weeklyResetAt ? new Date(weeklyResetAt) : null,
+        }),
+        parseGeminiLocalLogs({
+          sessionResetAt: geminiSessionResetAt ? new Date(geminiSessionResetAt) : null,
+          weeklyResetAt: geminiWeeklyResetAt ? new Date(geminiWeeklyResetAt) : null,
+        }),
+      ]);
+      parentPort.postMessage({ id, ok: true, summary: { claude, gemini } });
+      return;
+    }
+    const fn = provider === 'gemini' ? parseGeminiLocalLogs : parseLocalLogs;
+    const summary = await fn({
       sessionResetAt: sessionResetAt ? new Date(sessionResetAt) : null,
       weeklyResetAt: weeklyResetAt ? new Date(weeklyResetAt) : null,
     });
