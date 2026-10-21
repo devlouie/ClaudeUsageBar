@@ -166,6 +166,9 @@ function createPoller({
         ? `Gemini API error: ${geminiResult.error}`
         : `Gemini API error (HTTP ${geminiResult.status ?? '?'})`;
     }
+    if (state.geminiLocalCosts && state.geminiLocalCosts.monthTokens > 0) {
+      state.geminiHasLoaded = true;
+    }
     if (!getToken()) onError();
   }
 
