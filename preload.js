@@ -13,6 +13,5 @@ contextBridge.exposeInMainWorld('claudeBar', {
   // send(). Fire-and-forget; no return value, no promise round-trip.
   hide: () => ipcRenderer.send('hide'),
   quit: () => ipcRenderer.send('quit'),
-  openExternal: (url) => ipcRenderer.send('open-external', url),
   setHeight: (h) => ipcRenderer.send('set-height', h),
 });

@@ -1,5 +1,6 @@
-// Per-million-token rates in USD for the Claude API.
-// Source: https://platform.claude.com/docs/en/about-claude/pricing
+// Per-million-token rates in USD.
+// Claude: https://platform.claude.com/docs/en/about-claude/pricing
+// Gemini: https://aistudio.google.com/docs/pricing (paid tier, Standard)
 //
 // Rules the table encodes:
 //   * Cache hits cost 0.1x base input, except 0.025x on Fable 5.1 and
@@ -12,14 +13,23 @@
 //     the higher tier for the whole request.
 //   * Fast mode costs $8/$40 on Opus 5.5 and $10/$50 on Opus 5 and 4.8.
 //     Cache rates scale by the same 2x multiplier.
+//   * Gemini 4 Argon and Gemini 3.6 and 3.8 Flash have dated price rises.
+//     Each request is priced by its own timestamp, so old days keep old prices.
+//   * Gemini Pro input, output, and cache rates rise above a 200K prompt.
 //
-// Prices go stale. Bump LAST_VERIFIED whenever you re-check the page above.
+// Prices go stale. Bump LAST_VERIFIED whenever you re-check the pages above.
 // Override at runtime by pointing CLAUDE_USAGE_PRICING_JSON at a JSON file
 // shaped like DEFAULT_RATES below. Matching keys overwrite, others stay.
-const LAST_VERIFIED = '2026-10-20';
+const LAST_VERIFIED = '2026-11-05';
 
 function r(input, output, cacheRead, cacheWrite, cacheWrite1h) {
   return { input, output, cacheRead, cacheWrite, cacheWrite1h };
+}
+
+// Gemini bills cache storage by the hour and has no per-token write charge in
+// these logs. The write columns mirror input to keep the shape uniform.
+function g(input, output, cacheRead) {
+  return r(input, output, cacheRead, input, input);
 }
 
 const DEFAULT_RATES = {
@@ -40,16 +50,26 @@ const DEFAULT_RATES = {
   haiku45:     r(1,     5,     0.10,  1.25,   2),     // Haiku 4.5
   haiku35:     r(0.80,  4,     0.08,  1.0,    1.60),  // Haiku 3.5
   haiku3:      r(0.25,  1.25,  0.03,  0.30,   0.50),  // Haiku 3
-  // Gemini API per-million-token rates (USD)
-  geminiArgon:     r(2.0,   12.0,  0.20,    2.50,    4.0),   // Gemini 4 Argon
-  geminiPro:       r(1.25,  10.0,  0.3125,  1.5625,  2.50),  // Gemini 3.1 / 3 / 2.5 Pro (<= 200K)
-  geminiProLong:   r(2.50,  15.0,  0.625,   3.125,   5.0),   // Gemini Pro (> 200K prompt)
-  geminiFlash:     r(0.15,  0.60,  0.0375,  0.1875,  0.30),  // Gemini 3.x / 2.5 Flash
-  geminiFlashLite: r(0.075, 0.30,  0.01875, 0.09375, 0.15),  // Gemini Flash-Lite
+  //                     input  output cacheRead
+  geminiArgon:        g(2,     10,    0.10),   // Gemini 4 Argon, through 2026-11-30
+  geminiArgonDec26:   g(4,     20,    0.20),   // Gemini 4 Argon, from 2026-12-01
+  geminiFlash38:      g(0.75,  3.75,  0.075),  // Gemini 3.6 and 3.8 Flash, through 2026-12-31
+  geminiFlash38Jan27: g(1.5,   7.5,   0.15),   // Gemini 3.6 and 3.8 Flash, from 2027-01-01
+  geminiFlash3:       g(0.5,   3,     0.05),   // Gemini 3 Flash
+  geminiFlash25:      g(0.3,   2.5,   0.03),   // Gemini 2.5 Flash
+  geminiPro31:        g(2,     12,    0.20),   // Gemini 3.1 Pro, prompt up to 200K
+  geminiPro31Long:    g(4,     18,    0.40),   // Gemini 3.1 Pro, prompt above 200K
+  geminiPro25:        g(1.25,  10,    0.125),  // Gemini 2.5 Pro, prompt up to 200K
+  geminiPro25Long:    g(2.5,   15,    0.25),   // Gemini 2.5 Pro, prompt above 200K
+  geminiLite35:       g(0.3,   2.5,   0.03),   // Gemini 3.5 Flash-Lite
+  geminiLite31:       g(0.25,  1.5,   0.025),  // Gemini 3.1 Flash-Lite
+  geminiLite25:       g(0.1,   0.4,   0.01),   // Gemini 2.5 Flash-Lite
 };
 
-const SONNET_LONG_THRESHOLD = 200_000;
+const LONG_PROMPT_200K = 200_000;
 const HAIKU_LONG_THRESHOLD = 100_000;
+const ARGON_PRICE_RISE = Date.UTC(2026, 11, 1);
+const FLASH_PRICE_RISE = Date.UTC(2027, 0, 1);
 
 const RATES = loadRates();
 
@@ -68,7 +88,8 @@ function loadRates() {
 
 // Model ids can carry a bracketed variant suffix (for example
 // "claude-opus-5-5[1m]") or parenthesized quality tags ("Gemini 4 Argon (High)").
-// Strip them so variants price and name like their base model.
+// Strip them so variants price and name like their base model. Antigravity also
+// logs display names ("Claude Opus 5.5"), so fold those into the id form.
 function normalize(model) {
   const raw = (model || '')
     .toLowerCase()
@@ -77,6 +98,7 @@ function normalize(model) {
     .trim();
   if (raw === 'model_placeholder_m417') return 'gemini-4-argon';
   if (raw.startsWith('gemini ')) return raw.replace(/\s+/g, '-');
+  if (raw.startsWith('claude ')) return raw.replace(/\s+/g, '-').replace(/(\d)\.(\d)/g, '$1-$2');
   return raw;
 }
 
@@ -126,16 +148,25 @@ function versionNumber(model) {
 }
 
 // Which rate row a request bills against. A bare family name with no
-// version ("opus") bills as the current model in that family.
-function tier(model, { promptTokens = 0, speed } = {}) {
+// version ("opus") bills as the current model in that family. `at` is the
+// request time in ms, for models with a dated price rise.
+function tier(model, { promptTokens = 0, speed, at = Date.now() } = {}) {
   const f = family(model);
   const v = versionNumber(model);
   const fast = speed === 'fast';
-  if (f === 'gemini-argon') return 'geminiArgon';
-  if (f === 'gemini-flash-lite') return 'geminiFlashLite';
-  if (f === 'gemini-flash') return 'geminiFlash';
+  if (f === 'gemini-argon') return at >= ARGON_PRICE_RISE ? 'geminiArgonDec26' : 'geminiArgon';
+  if (f === 'gemini-flash-lite') {
+    if (v == null || v >= 3.5) return 'geminiLite35';
+    return v >= 3.1 ? 'geminiLite31' : 'geminiLite25';
+  }
+  if (f === 'gemini-flash') {
+    if (v == null || v >= 3.6) return at >= FLASH_PRICE_RISE ? 'geminiFlash38Jan27' : 'geminiFlash38';
+    return v >= 3 ? 'geminiFlash3' : 'geminiFlash25';
+  }
   if (f === 'gemini-pro') {
-    return promptTokens > SONNET_LONG_THRESHOLD ? 'geminiProLong' : 'geminiPro';
+    const long = promptTokens > LONG_PROMPT_200K;
+    if (v == null || v >= 3) return long ? 'geminiPro31Long' : 'geminiPro31';
+    return long ? 'geminiPro25Long' : 'geminiPro25';
   }
   if (f === 'fable') return v != null && v >= 5.1 ? 'fable51' : 'fable5';
   if (f === 'opus') {
@@ -151,7 +182,7 @@ function tier(model, { promptTokens = 0, speed } = {}) {
   }
   if (v == null || v >= 5.5) return 'sonnet55';
   if (v >= 5) return 'sonnet5';
-  if (v < 4.6 && promptTokens > SONNET_LONG_THRESHOLD) return 'sonnetLong';
+  if (v < 4.6 && promptTokens > LONG_PROMPT_200K) return 'sonnetLong';
   return 'sonnet';
 }
 
@@ -165,9 +196,9 @@ function rates(model, opts) {
 // cacheWrite is the 5-minute cache. cacheWrite1h is the 1-hour cache.
 // Prompt length for tiered models counts every input token in the request,
 // including cache reads and writes.
-function cost({ model, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, cacheWrite1h = 0, speed } = {}) {
+function cost({ model, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, cacheWrite1h = 0, speed, at } = {}) {
   const promptTokens = input + cacheRead + cacheWrite + cacheWrite1h;
-  const rt = rates(model, { promptTokens, speed });
+  const rt = rates(model, { promptTokens, speed, at });
   return (
     input * rt.input +
     output * rt.output +

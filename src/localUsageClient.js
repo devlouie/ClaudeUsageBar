@@ -1,10 +1,14 @@
 // Main-thread client for the local-usage worker.
 //
-// Falls back to an in-process parse if the worker can't start, so a packaging
-// or platform problem degrades to the old behaviour rather than losing the
-// local spend numbers entirely.
+// Falls back to an in-process parse if the worker can't start or dies, so a
+// packaging or platform problem degrades to slower numbers rather than none.
+// A worker that hangs is terminated and the request rejects, so the caller
+// keeps its last numbers and the poll loop carries on. It does not fall back,
+// because whatever hung the worker would then hang the main thread too.
 
 const path = require('path');
+
+const WORKER_TIMEOUT_MS = 120_000;
 
 let worker = null;
 let seq = 0;
@@ -15,28 +19,42 @@ function startWorker() {
   if (worker) return worker;
   try {
     const { Worker } = require('worker_threads');
-    worker = new Worker(path.join(__dirname, 'localUsageWorker.js'));
-    worker.on('message', (msg) => {
+    const w = new Worker(path.join(__dirname, 'localUsageWorker.js'));
+    w.on('message', (msg) => {
       const entry = pending.get(msg.id);
       if (!entry) return;
       pending.delete(msg.id);
-      if (pending.size === 0 && worker) worker.unref();
+      clearTimeout(entry.timer);
+      if (pending.size === 0 && worker === w) w.unref();
       if (msg.ok) entry.resolve(msg.summary);
       else entry.reject(new Error(msg.error || 'worker error'));
     });
-    worker.on('error', () => { failAll(); });
-    worker.on('exit', () => { failAll(); });
-    worker.unref(); // idle worker must not hold the process open
+    const onGone = () => { if (worker === w) failAll(new Error('worker exited')); };
+    w.on('error', onGone);
+    w.on('exit', onGone);
+    w.unref(); // idle worker must not hold the process open
+    worker = w;
   } catch {
     worker = null;
   }
   return worker;
 }
 
-function failAll() {
+function failAll(err) {
   worker = null;
-  for (const [, entry] of pending) entry.reject(new Error('worker exited'));
+  for (const entry of pending.values()) {
+    clearTimeout(entry.timer);
+    entry.reject(err);
+  }
   pending.clear();
+}
+
+function onTimeout() {
+  const w = worker;
+  const err = new Error('worker timed out');
+  err.code = 'WORKER_TIMEOUT';
+  failAll(err);
+  if (w) w.terminate().catch(() => {});
 }
 
 async function parseLocalLogsAsync(opts = {}) {
@@ -44,49 +62,34 @@ async function parseLocalLogsAsync(opts = {}) {
   if (!w) return inProcess(opts);
 
   const id = ++seq;
-  const payload = {
-    id,
-    provider: opts.provider || 'claude',
-    sessionResetAt: opts.sessionResetAt ? opts.sessionResetAt.toISOString() : null,
-    weeklyResetAt: opts.weeklyResetAt ? opts.weeklyResetAt.toISOString() : null,
-    geminiSessionResetAt: opts.geminiSessionResetAt ? opts.geminiSessionResetAt.toISOString() : null,
-    geminiWeeklyResetAt: opts.geminiWeeklyResetAt ? opts.geminiWeeklyResetAt.toISOString() : null,
-  };
-
   try {
     return await new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(onTimeout, WORKER_TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
       w.ref(); // hold the loop open until this reply lands
-      w.postMessage(payload);
+      w.postMessage({
+        id,
+        sessionResetAt: opts.sessionResetAt ? opts.sessionResetAt.toISOString() : null,
+        geminiSessionResetAt: opts.geminiSessionResetAt ? opts.geminiSessionResetAt.toISOString() : null,
+      });
     });
-  } catch {
-    // Worker died mid-flight. Serve this tick in-process.
-    return inProcess(opts);
+  } catch (e) {
+    if (e.code === 'WORKER_TIMEOUT') throw e;
+    return inProcess(opts); // worker died mid-flight. Serve this tick in-process.
   }
 }
 
-async function inProcess(opts) {
+function inProcess(opts) {
   if (!fallback) fallback = require('./localUsage');
-  if (opts.provider === 'both') {
-    const [claude, gemini] = await Promise.all([
-      fallback.parseLocalLogs({
-        sessionResetAt: opts.sessionResetAt || null,
-        weeklyResetAt: opts.weeklyResetAt || null,
-      }),
-      fallback.parseGeminiLocalLogs({
-        sessionResetAt: opts.geminiSessionResetAt || null,
-        weeklyResetAt: opts.geminiWeeklyResetAt || null,
-      }),
-    ]);
-    return { claude, gemini };
-  }
-  if (opts.provider === 'gemini') return fallback.parseGeminiLocalLogs(opts);
-  return fallback.parseLocalLogs(opts);
+  return fallback.parseAllLogs(opts);
 }
 
 function stop() {
-  if (worker) { worker.terminate().catch(() => {}); worker = null; }
+  const w = worker;
+  worker = null;
+  for (const entry of pending.values()) clearTimeout(entry.timer);
   pending.clear();
+  if (w) w.terminate().catch(() => {});
 }
 
 module.exports = { parseLocalLogsAsync, stop };

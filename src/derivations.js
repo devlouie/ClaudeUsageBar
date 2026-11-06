@@ -2,94 +2,36 @@
 // renderer + tray expect. No IPC, no timers, no Electron. Keep it that way
 // so this file stays trivially testable.
 
-const { bucketTotal } = require('./localUsage');
+const SESSION_MS = 5 * 3600 * 1000;
 
 function clamp(v) {
   if (v == null || !Number.isFinite(v)) return 0;
   return Math.max(0, Math.min(100, v));
 }
 
-function sessionPercent(state) { return clamp(state.usage?.five_hour?.utilization); }
-function weeklyPercent(state)  { return clamp(state.usage?.seven_day?.utilization); }
+// ---------------------------------------------------------------------------
+// Windows. A window is { utilization, resets_at }.
+// ---------------------------------------------------------------------------
 
-// As of the 2026-07 weekly-limits rollout, Anthropic exposes per-model weekly
-// meters through a `limits[]` array (kind `weekly_scoped`, carrying a
-// `scope.model.display_name`) rather than the legacy top-level
-// `seven_day_opus` / `seven_day_sonnet` objects. Those now come back `null`.
-// Fable in particular has its own weekly allocation ("up to 50% of weekly
-// limits" through 2026-07-19, then metered usage credits). We read the scoped
-// limit first and fall back to the legacy field so older/newer API shapes both
-// light up.
-function scopedWeeklyPercent(state, modelName) {
-  const limits = state.usage?.limits;
-  if (Array.isArray(limits)) {
-    const wanted = modelName.toLowerCase();
-    for (const l of limits) {
-      if (l?.group !== 'weekly' && l?.kind !== 'weekly_scoped') continue;
-      const dn = (l?.scope?.model?.display_name || '').toLowerCase();
-      const id = (l?.scope?.model?.id || '').toLowerCase();
-      if (dn.includes(wanted) || id.includes(wanted)) return clamp(l.percent);
-    }
-  }
-  return null;
+function resetTime(win) {
+  const t = Date.parse(win?.resets_at ?? '');
+  return Number.isFinite(t) ? t : null;
 }
 
-function fablePercent(state) {
-  const scoped = scopedWeeklyPercent(state, 'fable');
-  if (scoped != null) return scoped;
-  // Mythos shares Fable-tier metering; check it too before the legacy fallback.
-  const mythos = scopedWeeklyPercent(state, 'mythos');
-  if (mythos != null) return mythos;
-  return clamp(state.usage?.seven_day_fable?.utilization);
+// Once a window's reset time passes, its last reading is history. A failed or
+// delayed poll must not keep a limit pinned at a number that no longer applies.
+function windowPercent(win) {
+  const reset = resetTime(win);
+  if (reset != null && reset <= Date.now()) return 0;
+  return clamp(win?.utilization);
 }
 
-function opusPercent(state) {
-  const scoped = scopedWeeklyPercent(state, 'opus');
-  if (scoped != null) return scoped;
-  return clamp(state.usage?.seven_day_opus?.utilization);
-}
-
-function sonnetPercent(state) {
-  const scoped = scopedWeeklyPercent(state, 'sonnet');
-  if (scoped != null) return scoped;
-  return clamp(state.usage?.seven_day_sonnet?.utilization);
-}
-
-function sessionElapsedPercent(state) {
-  const resetStr = state.usage?.five_hour?.resets_at;
-  if (!resetStr) return 0;
-  const reset = new Date(resetStr);
-  if (Number.isNaN(reset.getTime())) return 0;
-  const remainingMs = reset.getTime() - Date.now();
-  if (remainingMs <= 0) return 100;
-  const windowMs = 5 * 3600 * 1000;
-  const elapsed = windowMs - remainingMs;
-  return Math.max(0, Math.min(100, (elapsed / windowMs) * 100));
-}
-
-function worstWindow(state) {
-  const candidates = [
-    { tag: 'S', percent: sessionPercent(state) },
-    { tag: 'W', percent: weeklyPercent(state) },
-    { tag: 'F', percent: fablePercent(state) },
-    { tag: 'O', percent: opusPercent(state) },
-  ];
-  return candidates.reduce((a, b) => (b.percent > a.percent ? b : a));
-}
-
-function planDisplayName(state) {
-  const sub = (state.subscriptionType || '').toLowerCase();
-  const tier = state.rateLimitTier || '';
-  if (sub === 'max') {
-    if (tier.includes('20x')) return 'Max 20x';
-    if (tier.includes('5x'))  return 'Max 5x';
-    return 'Max';
-  }
-  if (sub === 'pro')  return 'Pro';
-  if (sub === 'free') return 'Free';
-  return state.subscriptionType
-    ? state.subscriptionType[0].toUpperCase() + state.subscriptionType.slice(1)
-    : 'Unknown';
+function windowElapsedPercent(win, lengthMs) {
+  const reset = resetTime(win);
+  if (reset == null) return 0;
+  const remaining = reset - Date.now();
+  if (remaining <= 0) return 0;
+  return clamp(((lengthMs - remaining) / lengthMs) * 100);
 }
 
 function timeUntilReset(isoString) {
@@ -107,83 +49,152 @@ function timeUntilReset(isoString) {
   return `resets in ${Math.max(1, minutes)}m`;
 }
 
-function computeBurnRate(state) {
-  // Tokens/min across the current 5h session, derived from local logs.
-  if (!state.localCosts) return null;
-  const elapsedPct = sessionElapsedPercent(state);
-  if (elapsedPct <= 0.5) return null; // avoid div-by-~0 right after reset
-  const elapsedMin = (elapsedPct / 100) * (5 * 60);
-  if (elapsedMin <= 0) return null;
-  const su = state.localCosts.sessionUsage;
-  const totalTokens = su.input + su.output + su.cacheRead + su.cacheWrite;
-  if (totalTokens <= 0) return 0;
-  return totalTokens / elapsedMin;
+// How the session is tracking against the clock. Too early to judge in the
+// first 15 minutes (5% of the window). A ratio above 1 runs out before reset.
+function sessionPace(win) {
+  const percent = windowPercent(win);
+  const elapsedPct = windowElapsedPercent(win, SESSION_MS);
+  const ratio = elapsedPct > 0 ? percent / elapsedPct : 0;
+  let verdict = 'pace';
+  if (elapsedPct < 5) verdict = 'fresh';
+  else if (ratio >= 1.5) verdict = 'burning';
+  else if (ratio >= 1.02) verdict = 'fast';
+  else if (ratio <= 0.5) verdict = 'idle';
+  const projectedPct = elapsedPct <= 1 ? percent : Math.min(999, ratio * 100);
+  return { elapsedPct, projectedPct, verdict };
 }
 
-function projectedSessionPercent(state) {
-  const sp = sessionPercent(state);
-  const ep = sessionElapsedPercent(state);
-  if (ep <= 1) return sp;
-  return Math.max(0, Math.min(999, (sp / ep) * 100));
+function limitRow(key, label, short, win, { paced = false } = {}) {
+  return {
+    key,
+    label,
+    short,
+    percent: windowPercent(win),
+    resetIn: timeUntilReset(win?.resets_at),
+    pace: paced ? sessionPace(win) : null,
+  };
 }
 
-function paceVerdict(state) {
-  const sp = sessionPercent(state);
-  const ep = sessionElapsedPercent(state);
-  if (ep < 2) return 'fresh';
-  const ratio = sp / ep;
-  if (ratio >= 1.5)  return 'burning';
-  if (ratio >= 1.15) return 'fast';
-  if (ratio <= 0.5)  return 'idle';
-  return 'pace';
+function worstPercent(rows) {
+  return rows.reduce((max, r) => Math.max(max, r.percent), 0);
 }
 
 // ---------------------------------------------------------------------------
-// Gemini derivations
+// Claude
 // ---------------------------------------------------------------------------
+
+// Anthropic reports per-model weekly meters through a `limits[]` array (kind
+// `weekly_scoped`, carrying `scope.model.display_name`). Whichever models the
+// plan meters show up here, so we list them rather than assume. The legacy
+// top-level `seven_day_*` objects now come back null, and are read only as a
+// fallback for older API shapes.
+function scopedLimits(usage) {
+  const found = new Map();
+  for (const l of Array.isArray(usage?.limits) ? usage.limits : []) {
+    if (l?.group !== 'weekly' && l?.kind !== 'weekly_scoped') continue;
+    const name = l?.scope?.model?.display_name || l?.scope?.model?.id;
+    if (!name) continue;
+    found.set(String(name).toLowerCase(), { name, win: { utilization: l.percent, resets_at: l.resets_at } });
+  }
+  const legacy = { fable: 'Fable', opus: 'Opus', sonnet: 'Sonnet' };
+  for (const [key, name] of Object.entries(legacy)) {
+    const win = usage?.[`seven_day_${key}`];
+    if (win && !found.has(key)) found.set(key, { name, win });
+  }
+  return [...found.entries()].map(([key, v]) => ({ key, ...v }));
+}
+
+function claudeLimits(state) {
+  const u = state.usage;
+  if (!u) return [];
+  const rows = [limitRow('session', 'Session', 'Session', u.five_hour, { paced: true })];
+  if (u.seven_day) rows.push(limitRow('weekly', 'Weekly', 'Weekly', u.seven_day));
+  for (const { key, name, win } of scopedLimits(u)) {
+    rows.push(limitRow(key, `${name} 7d`, name, win));
+  }
+  return rows;
+}
+
+function sessionPercent(state) {
+  return windowPercent(state.usage?.five_hour);
+}
+
+function planDisplayName(state) {
+  const sub = (state.subscriptionType || '').toLowerCase();
+  const tier = state.rateLimitTier || '';
+  if (sub === 'max') {
+    if (tier.includes('20x')) return 'Max 20x';
+    if (tier.includes('5x'))  return 'Max 5x';
+    return 'Max';
+  }
+  if (sub === 'pro')  return 'Pro';
+  if (sub === 'free') return 'Free';
+  return state.subscriptionType
+    ? state.subscriptionType[0].toUpperCase() + state.subscriptionType.slice(1)
+    : 'Unknown';
+}
+
+function formatMoney(amount, currency) {
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${currency}`;
+  }
+}
+
+// used_credits and monthly_limit are in minor units. `decimal_places` says how
+// many, so 1234 with 2 places is $12.34.
+function claudeExtraUsage(state) {
+  const ex = state.usage?.extra_usage;
+  if (!ex?.is_enabled || ex.used_credits == null) return null;
+  const scale = 10 ** (Number.isInteger(ex.decimal_places) ? ex.decimal_places : 2);
+  const currency = ex.currency || 'USD';
+  const used = Number(ex.used_credits) / scale;
+  if (!Number.isFinite(used)) return null;
+  const limit = ex.monthly_limit == null ? null : Number(ex.monthly_limit) / scale;
+  if (limit > 0) {
+    return {
+      label: 'Extra usage',
+      percent: clamp((used / limit) * 100),
+      text: `${formatMoney(used, currency)} / ${formatMoney(limit, currency)}`,
+    };
+  }
+  return { label: 'Extra usage', percent: null, text: `${formatMoney(used, currency)} used` };
+}
+
+// ---------------------------------------------------------------------------
+// Gemini
+// ---------------------------------------------------------------------------
+
+function geminiLimits(state) {
+  const u = state.geminiUsage;
+  if (!u) return [];
+  const rows = [];
+  if (u.five_hour) rows.push(limitRow('session', 'Gemini 5h', 'Session 5h', u.five_hour, { paced: true }));
+  if (u.seven_day) rows.push(limitRow('weekly', 'Gemini 7d', 'Weekly 7d', u.seven_day));
+
+  // Per-model buckets usually repeat the session number. Show one only when it
+  // says something the session row does not.
+  const session = Math.round(windowPercent(u.five_hour));
+  if (u.pro_five_hour && Math.round(windowPercent(u.pro_five_hour)) !== session) {
+    rows.push(limitRow('pro', 'Gemini Pro', 'Pro', u.pro_five_hour));
+  }
+  if (u.flash_five_hour && Math.round(windowPercent(u.flash_five_hour)) !== session) {
+    rows.push(limitRow('flash', 'Gemini Flash', 'Flash', u.flash_five_hour));
+  }
+
+  // Partner models (Claude and GPT inside Antigravity) have their own quota.
+  if (u.third_party_five_hour) {
+    rows.push(limitRow('partner5h', 'Partner models 5h', 'Partner 5h', u.third_party_five_hour));
+  }
+  if (u.third_party_seven_day) {
+    rows.push(limitRow('partner7d', 'Partner models 7d', 'Partner 7d', u.third_party_seven_day));
+  }
+  return rows;
+}
 
 function geminiSessionPercent(state) {
-  return clamp(state.geminiUsage?.five_hour?.utilization);
-}
-
-function geminiWeeklyPercent(state) {
-  return clamp(state.geminiUsage?.seven_day?.utilization);
-}
-
-function geminiProPercent(state) {
-  return clamp(
-    state.geminiUsage?.pro_five_hour?.utilization
-    ?? state.geminiUsage?.five_hour?.utilization
-  );
-}
-
-function geminiFlashPercent(state) {
-  return clamp(
-    state.geminiUsage?.flash_five_hour?.utilization
-    ?? state.geminiUsage?.five_hour?.utilization
-  );
-}
-
-function geminiSessionElapsedPercent(state) {
-  const resetStr = state.geminiUsage?.five_hour?.resets_at;
-  if (!resetStr) return 0;
-  const reset = new Date(resetStr);
-  if (Number.isNaN(reset.getTime())) return 0;
-  const remainingMs = reset.getTime() - Date.now();
-  if (remainingMs <= 0) return 100;
-  const windowMs = 5 * 3600 * 1000;
-  const elapsed = windowMs - remainingMs;
-  return Math.max(0, Math.min(100, (elapsed / windowMs) * 100));
-}
-
-function geminiWorstWindow(state) {
-  const candidates = [
-    { tag: 'S', percent: geminiSessionPercent(state) },
-    { tag: 'W', percent: geminiWeeklyPercent(state) },
-    { tag: 'P', percent: geminiProPercent(state) },
-    { tag: 'Fl', percent: geminiFlashPercent(state) },
-  ];
-  return candidates.reduce((a, b) => (b.percent > a.percent ? b : a));
+  return windowPercent(state.geminiUsage?.five_hour);
 }
 
 function geminiPlanDisplayName(state) {
@@ -205,84 +216,42 @@ function geminiPlanDisplayName(state) {
   return 'Unknown';
 }
 
-function computeGeminiBurnRate(state) {
-  if (!state.geminiLocalCosts) return null;
-  const su = state.geminiLocalCosts.sessionUsage;
-  const totalTokens = su.input + su.output + su.cacheRead + su.cacheWrite;
-  const elapsedPct = geminiSessionElapsedPercent(state);
-  if (elapsedPct > 0.5) {
-    const elapsedMin = (elapsedPct / 100) * (5 * 60);
-    if (elapsedMin > 0) return totalTokens <= 0 ? 0 : totalTokens / elapsedMin;
-  }
-  if (totalTokens <= 0) return 0;
-  return totalTokens / (5 * 60);
-}
-
-function geminiProjectedSessionPercent(state) {
-  const sp = geminiSessionPercent(state);
-  const ep = geminiSessionElapsedPercent(state);
-  if (ep <= 1) return sp;
-  return Math.max(0, Math.min(999, (sp / ep) * 100));
-}
-
-function geminiPaceVerdict(state) {
-  const sp = geminiSessionPercent(state);
-  const ep = geminiSessionElapsedPercent(state);
-  if (ep < 2) return 'fresh';
-  const ratio = sp / ep;
-  if (ratio >= 1.5)  return 'burning';
-  if (ratio >= 1.15) return 'fast';
-  if (ratio <= 0.5)  return 'idle';
-  return 'pace';
-}
-
 function geminiExtraUsage(state) {
   const credits = state.geminiUsage?.availableCredits;
   if (Array.isArray(credits) && credits.length > 0) {
     const c = credits[0];
     const rem = Number(c.creditAmount ?? c.remainingAmount);
     if (Number.isFinite(rem) && rem > 0) {
-      return {
-        is_enabled: true,
-        label: 'AI Credits',
-        used_credits: null,
-        monthly_limit: null,
-        display_text: `${rem} credits available`,
-      };
+      return { label: 'AI credits', percent: null, text: `${rem} credits available` };
     }
   }
-  const tp5h = state.geminiUsage?.third_party_five_hour?.utilization;
-  const tp7d = state.geminiUsage?.third_party_seven_day?.utilization;
-  if ((Number.isFinite(tp5h) && tp5h > 0) || (Number.isFinite(tp7d) && tp7d > 0)) {
-    return {
-      is_enabled: true,
-      label: '3P Partner Quota',
-      used_credits: null,
-      monthly_limit: null,
-      display_text: `${Math.round(tp5h || 0)}% 5h · ${Math.round(tp7d || 0)}% 7d`,
-    };
-  }
   if (state.geminiUsage?.apiKeyInfo?.configured) {
-    const cost = state.geminiLocalCosts?.monthCost ?? 0;
+    const usd = state.geminiLocalCosts?.monthCost ?? 0;
     const status = state.geminiUsage.apiKeyInfo.status || 'valid';
-    return {
-      is_enabled: true,
-      label: 'API Key Spend',
-      used_credits: null,
-      monthly_limit: null,
-      display_text: `$${cost.toFixed(2)} est. (30d · ${status})`,
-    };
+    return { label: 'API key spend', percent: null, text: `$${usd.toFixed(2)} est. (30d · ${status})` };
   }
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Local costs
+// ---------------------------------------------------------------------------
+
+// Tokens per minute across the current session. With `fallback`, a provider
+// that reports no session clock averages over the last 5 hours instead.
+function burnRate(localCosts, sessionWindow, { fallback = false } = {}) {
+  if (!localCosts) return null;
+  const su = localCosts.sessionUsage;
+  const totalTokens = su.input + su.output + su.cacheRead + su.cacheWrite;
+  const elapsedPct = windowElapsedPercent(sessionWindow, SESSION_MS);
+  if (elapsedPct > 0.5) return totalTokens / ((elapsedPct / 100) * (SESSION_MS / 60000));
+  return fallback ? totalTokens / (SESSION_MS / 60000) : null; // no clock, or just reset
+}
+
 function mergeMaps(a, b) {
   const out = {};
-  if (a) {
-    for (const [k, v] of Object.entries(a)) out[k] = (out[k] || 0) + v;
-  }
-  if (b) {
-    for (const [k, v] of Object.entries(b)) out[k] = (out[k] || 0) + v;
+  for (const m of [a, b]) {
+    if (m) for (const [k, v] of Object.entries(m)) out[k] = (out[k] || 0) + v;
   }
   return out;
 }
@@ -296,12 +265,6 @@ function formatLocalCosts(lc) {
     weekCost: lc.weekCost ?? 0,
     monthTokens: lc.monthTokens,
     monthCost: lc.monthCost ?? 0,
-    sessionTotal:  bucketTotal(lc.sessionUsage),
-    sessionInput:  lc.sessionUsage.input + lc.sessionUsage.cacheRead + lc.sessionUsage.cacheWrite,
-    sessionOutput: lc.sessionUsage.output,
-    weeklyTotal:   bucketTotal(lc.weeklyUsage),
-    weeklyInput:   lc.weeklyUsage.input + lc.weeklyUsage.cacheRead + lc.weeklyUsage.cacheWrite,
-    weeklyOutput:  lc.weeklyUsage.output,
     modelBreakdown: lc.modelBreakdown || {},
     todayModelBreakdown: lc.todayModelBreakdown || {},
     weekModelBreakdown: lc.weekModelBreakdown || {},
@@ -337,10 +300,6 @@ function combinedLocalCosts(state) {
     };
   }
 
-  const cSu = c?.sessionUsage || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  const gSu = g?.sessionUsage || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  const cWu = c?.weeklyUsage  || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  const gWu = g?.weeklyUsage  || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   return {
     todayTokens: (c?.todayTokens || 0) + (g?.todayTokens || 0),
     todayCost:   (c?.todayCost || 0) + (g?.todayCost || 0),
@@ -348,12 +307,6 @@ function combinedLocalCosts(state) {
     weekCost:    (c?.weekCost || 0) + (g?.weekCost || 0),
     monthTokens: (c?.monthTokens || 0) + (g?.monthTokens || 0),
     monthCost:   (c?.monthCost || 0) + (g?.monthCost || 0),
-    sessionTotal: bucketTotal(cSu) + bucketTotal(gSu),
-    sessionInput: cSu.input + cSu.cacheRead + cSu.cacheWrite + gSu.input + gSu.cacheRead + gSu.cacheWrite,
-    sessionOutput: cSu.output + gSu.output,
-    weeklyTotal: bucketTotal(cWu) + bucketTotal(gWu),
-    weeklyInput: cWu.input + cWu.cacheRead + cWu.cacheWrite + gWu.input + gWu.cacheRead + gWu.cacheWrite,
-    weeklyOutput: cWu.output + gWu.output,
     modelBreakdown: mergeMaps(c?.modelBreakdown, g?.modelBreakdown),
     todayModelBreakdown: mergeMaps(c?.todayModelBreakdown, g?.todayModelBreakdown),
     weekModelBreakdown: mergeMaps(c?.weekModelBreakdown, g?.weekModelBreakdown),
@@ -364,73 +317,92 @@ function combinedLocalCosts(state) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Combined + snapshot
+// ---------------------------------------------------------------------------
+
+// Every limit from both providers, so the worst number on the tab badge always
+// has a row to match it.
+function combinedLimits(state) {
+  const windows = { session: ['session', '5h'], weekly: ['weekly', '7d'] };
+  const claudeRows = claudeLimits(state).map((r) => {
+    const w = windows[r.key];
+    return {
+      ...r,
+      key: `claude:${r.key}`,
+      label: `Claude ${w ? w[0] : r.label}`,
+      short: `Claude ${w ? w[1] : r.short}`,
+    };
+  });
+  const geminiRows = geminiLimits(state).map((r) => {
+    const w = windows[r.key];
+    return {
+      ...r,
+      key: `gemini:${r.key}`,
+      label: w ? `Gemini ${w[0]}` : r.label,
+      short: w ? `Gemini ${w[1]}` : r.label === `Gemini ${r.short}` ? r.label : r.short,
+    };
+  });
+  return [...claudeRows, ...geminiRows];
+}
+
 function combinedWorstPercent(state) {
-  const cPct = state.hasLoaded ? worstWindow(state).percent : 0;
-  const gPct = state.geminiHasLoaded ? geminiWorstWindow(state).percent : 0;
-  return Math.max(cPct, gPct);
+  return Math.max(worstPercent(claudeLimits(state)), worstPercent(geminiLimits(state)));
+}
+
+function iso(d) {
+  return d ? d.toISOString() : null;
 }
 
 function snapshotForRenderer(state) {
-  const cBurn = computeBurnRate(state);
-  const gBurn = computeGeminiBurnRate(state);
-  const combinedBurn = (cBurn != null || gBurn != null) ? (cBurn || 0) + (gBurn || 0) : null;
-
+  const cLimits = claudeLimits(state);
+  const gLimits = geminiLimits(state);
+  const cBurn = burnRate(state.localCosts, state.usage?.five_hour);
+  const gBurn = burnRate(state.geminiLocalCosts, state.geminiUsage?.five_hour, { fallback: true });
   const cPlan = planDisplayName(state);
   const gPlan = geminiPlanDisplayName(state);
-  const combinedPlanParts = [];
-  if (state.hasLoaded || cPlan !== 'Unknown') combinedPlanParts.push(`Claude ${cPlan}`);
-  if (state.geminiHasLoaded || gPlan !== 'Unknown') combinedPlanParts.push(gPlan);
+
+  const planParts = [];
+  if (state.usage || cPlan !== 'Unknown') planParts.push(`Claude ${cPlan}`);
+  if (state.geminiUsage || gPlan !== 'Unknown') planParts.push(gPlan);
+
+  // The combined view is only as fresh as its older provider.
+  const fetchedAt = [state.usage && state.lastUpdated, state.geminiUsage && state.geminiLastUpdated].filter(Boolean);
+  const oldest = fetchedAt.length ? new Date(Math.min(...fetchedAt.map((d) => d.getTime()))) : null;
 
   return {
-    hasLoaded: state.hasLoaded,
-    isLoading: state.isLoading,
+    hasLoaded: Boolean(state.hasLoaded),
+    isLoading: Boolean(state.isLoading),
     errorMessage: state.errorMessage,
     credentialError: state.credentialError || null,
-    lastUpdated: state.lastUpdated ? state.lastUpdated.toISOString() : null,
-    sessionPercent: sessionPercent(state),
-    sessionElapsedPercent: sessionElapsedPercent(state),
-    weeklyPercent: weeklyPercent(state),
-    fablePercent: fablePercent(state),
-    opusPercent: opusPercent(state),
-    sonnetPercent: sonnetPercent(state),
-    fiveHourResetIn: timeUntilReset(state.usage?.five_hour?.resets_at),
-    sevenDayResetIn: timeUntilReset(state.usage?.seven_day?.resets_at),
-    extraUsage: state.usage?.extra_usage ?? null,
+    lastUpdated: iso(state.lastUpdated),
+    limits: cLimits,
+    worstPercent: cLimits.length ? worstPercent(cLimits) : null,
+    extraUsage: claudeExtraUsage(state),
     planName: cPlan,
     burnRate: cBurn,
-    projectedSessionPercent: projectedSessionPercent(state),
-    paceVerdict: paceVerdict(state),
-    worstWindowTag: state.hasLoaded ? worstWindow(state).tag : null,
-    worstWindowPercent: state.hasLoaded ? worstWindow(state).percent : 0,
     localCosts: formatLocalCosts(state.localCosts),
 
     gemini: {
       hasLoaded: Boolean(state.geminiHasLoaded),
-      isLoading: Boolean(state.isLoading),
       errorMessage: state.geminiErrorMessage || null,
       credentialError: state.geminiCredentialError || null,
-      sessionPercent: geminiSessionPercent(state),
-      sessionElapsedPercent: geminiSessionElapsedPercent(state),
-      weeklyPercent: geminiWeeklyPercent(state),
-      proPercent: geminiProPercent(state),
-      flashPercent: geminiFlashPercent(state),
-      fiveHourResetIn: timeUntilReset(state.geminiUsage?.five_hour?.resets_at),
-      sevenDayResetIn: timeUntilReset(state.geminiUsage?.seven_day?.resets_at),
+      lastUpdated: iso(state.geminiLastUpdated),
+      limits: gLimits,
+      worstPercent: gLimits.length ? worstPercent(gLimits) : null,
       extraUsage: geminiExtraUsage(state),
       planName: gPlan,
       burnRate: gBurn,
-      projectedSessionPercent: geminiProjectedSessionPercent(state),
-      paceVerdict: geminiPaceVerdict(state),
-      worstWindowTag: state.geminiHasLoaded ? geminiWorstWindow(state).tag : null,
-      worstWindowPercent: state.geminiHasLoaded ? geminiWorstWindow(state).percent : 0,
       localCosts: formatLocalCosts(state.geminiLocalCosts),
     },
 
     combined: {
       hasLoaded: Boolean(state.hasLoaded || state.geminiHasLoaded),
-      burnRate: combinedBurn,
-      planName: combinedPlanParts.join(' · ') || 'Unknown',
-      worstPercent: combinedWorstPercent(state),
+      lastUpdated: iso(oldest),
+      limits: combinedLimits(state),
+      worstPercent: cLimits.length || gLimits.length ? combinedWorstPercent(state) : null,
+      burnRate: cBurn != null || gBurn != null ? (cBurn || 0) + (gBurn || 0) : null,
+      planName: planParts.join(' · ') || 'Unknown',
       localCosts: combinedLocalCosts(state),
     },
   };
@@ -438,15 +410,9 @@ function snapshotForRenderer(state) {
 
 module.exports = {
   snapshotForRenderer,
-  worstWindow,
+  claudeLimits,
+  geminiLimits,
   sessionPercent,
-  weeklyPercent,
-  fablePercent,
-  opusPercent,
   geminiSessionPercent,
-  geminiWeeklyPercent,
-  geminiProPercent,
-  geminiFlashPercent,
-  geminiWorstWindow,
   combinedWorstPercent,
 };

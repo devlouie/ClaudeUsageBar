@@ -1,7 +1,12 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFile } = require('child_process');
+
+// macOS may show an "Always Allow" prompt while this runs. Give the user time
+// to answer it. The read is async, so a slow answer never blocks the main thread.
+const KEYCHAIN_TIMEOUT_MS = 60_000;
+const SECURITY_BIN = '/usr/bin/security';
 
 // Reasons returned alongside a failure so the UI can show targeted copy + CTA
 // instead of one flat "credentials not found" string.
@@ -22,11 +27,11 @@ const REASON = {
 //   pathsTried  - per-source diagnostic: [{ source, status, detail? }]
 //                 source = 'keychain' | absolute file path
 //                 status = 'ok' | 'not_found' | 'unreadable' | 'malformed' | 'locked'
-function readCredentials() {
+async function readCredentials() {
   const pathsTried = [];
 
   if (process.platform === 'darwin') {
-    const km = readMacKeychain();
+    const km = await readMacKeychain();
     pathsTried.push(km.diag);
     if (km.ok) return success(km.oauth, pathsTried);
     // If keychain is locked, surface that as the headline reason. Falling
@@ -54,31 +59,37 @@ function fail(reason, pathsTried) {
   return { ok: false, reason, pathsTried };
 }
 
-function readMacKeychain() {
-  try {
-    const out = execFileSync(
-      '/usr/bin/security',
-      ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 3000 }
-    ).trim();
-    const oauth = parseCredentialPayload(out);
-    if (!oauth) {
-      return { ok: false, diag: { source: 'keychain', status: 'malformed' } };
-    }
-    return { ok: true, oauth, diag: { source: 'keychain', status: 'ok' } };
-  } catch (e) {
-    // exit code 44 = item not found; 51 / non-zero with stderr containing
-    // "interaction is not allowed" or similar = locked. We don't get rich
-    // structured errors from `security`, so sniff the message text.
-    const msg = String(e.stderr || e.message || '');
-    if (/not be found|exit code 44/i.test(msg) || e.status === 44) {
-      return { ok: false, diag: { source: 'keychain', status: 'not_found' } };
-    }
-    if (/interaction is not allowed|denied|access/i.test(msg)) {
-      return { ok: false, diag: { source: 'keychain', status: 'locked' } };
-    }
-    return { ok: false, diag: { source: 'keychain', status: 'unreadable', detail: msg } };
+// Resolves { status, value?, detail? }, where status is 'ok', 'not_found',
+// 'locked', or 'unreadable'. `security` gives no structured errors, so we read
+// the exit code and sniff the message text.
+function readKeychainItem(service) {
+  return new Promise((resolve) => {
+    execFile(
+      SECURITY_BIN,
+      ['find-generic-password', '-s', service, '-w'],
+      { encoding: 'utf8', timeout: KEYCHAIN_TIMEOUT_MS },
+      (err, stdout, stderr) => {
+        if (!err) return resolve({ status: 'ok', value: stdout.trim() });
+        const msg = String(stderr || err.message || '');
+        if (err.code === 44 || /not be found/i.test(msg)) return resolve({ status: 'not_found' });
+        if (err.killed || /interaction is not allowed|denied|cancel|passphrase|access/i.test(msg)) {
+          return resolve({ status: 'locked' });
+        }
+        return resolve({ status: 'unreadable', detail: msg });
+      }
+    );
+  });
+}
+
+async function readMacKeychain() {
+  const source = 'keychain';
+  const item = await readKeychainItem('Claude Code-credentials');
+  if (item.status !== 'ok') {
+    return { ok: false, diag: { source, status: item.status, ...(item.detail ? { detail: item.detail } : {}) } };
   }
+  const oauth = parseCredentialPayload(item.value);
+  if (!oauth) return { ok: false, diag: { source, status: 'malformed' } };
+  return { ok: true, oauth, diag: { source, status: 'ok' } };
 }
 
 function readCredentialsFile(pathsTried) {
@@ -152,12 +163,12 @@ function parseCredentialPayload(raw) {
 // Gemini credentials (OAuth via Antigravity / Gemini CLI + Gemini API Key)
 // ---------------------------------------------------------------------------
 
-function readGeminiCredentials() {
+async function readGeminiCredentials() {
   const pathsTried = [];
   let oauth = null;
   let oauthReason = REASON.NOT_FOUND;
 
-  // 1. Check local OAuth files first (~/.gemini/jetski-standalone-oauth-token, ~/.gemini/oauth_creds.json)
+  // 1. Check local OAuth files first (Antigravity tokens, then ~/.gemini/oauth_creds.json)
   // and macOS Keychain (gemini-cli-oauth).
   const fileRes = readGeminiOAuthFiles(pathsTried);
   if (fileRes.ok) {
@@ -165,7 +176,7 @@ function readGeminiCredentials() {
   } else {
     oauthReason = fileRes.reason || REASON.NOT_FOUND;
     if (process.platform === 'darwin') {
-      const km = readGeminiMacKeychain();
+      const km = await readGeminiMacKeychain();
       pathsTried.push(km.diag);
       if (km.ok) {
         oauth = km.oauth;
@@ -188,7 +199,7 @@ function readGeminiCredentials() {
   }
 
   // 2. Check Gemini API Key (env vars, keychain, ~/.gemini/.env, ~/.gemini/api_key)
-  const apiKey = readGeminiApiKey(pathsTried);
+  const apiKey = await readGeminiApiKey(pathsTried);
 
   if (oauth || apiKey) {
     return {
@@ -213,6 +224,7 @@ function readGeminiOAuthFiles(pathsTried) {
   const home = os.homedir();
   const candidates = [
     { path: path.join(home, '.gemini', 'jetski-standalone-oauth-token'), clientType: 'jetski' },
+    { path: path.join(home, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), clientType: 'jetski' },
     { path: path.join(home, '.gemini', 'oauth_creds.json'), clientType: 'gemini-cli' },
     { path: path.join(home, '.config', 'gemini', 'oauth_creds.json'), clientType: 'gemini-cli' },
   ];
@@ -255,28 +267,15 @@ function readGeminiOAuthFiles(pathsTried) {
   return { ok: false, reason: sawAny ? lastReason : REASON.NOT_FOUND };
 }
 
-function readGeminiMacKeychain() {
-  try {
-    const out = execFileSync(
-      '/usr/bin/security',
-      ['find-generic-password', '-s', 'gemini-cli-oauth', '-w'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 3000 }
-    ).trim();
-    const oauth = parseGeminiOAuthPayload(out, 'gemini-cli', 'keychain:gemini-cli-oauth');
-    if (!oauth) {
-      return { ok: false, diag: { source: 'keychain:gemini-cli-oauth', status: 'malformed' } };
-    }
-    return { ok: true, oauth, diag: { source: 'keychain:gemini-cli-oauth', status: 'ok' } };
-  } catch (e) {
-    const msg = String(e.stderr || e.message || '');
-    if (/not be found|exit code 44/i.test(msg) || e.status === 44) {
-      return { ok: false, diag: { source: 'keychain:gemini-cli-oauth', status: 'not_found' } };
-    }
-    if (/interaction is not allowed|denied|access/i.test(msg)) {
-      return { ok: false, diag: { source: 'keychain:gemini-cli-oauth', status: 'locked' } };
-    }
-    return { ok: false, diag: { source: 'keychain:gemini-cli-oauth', status: 'unreadable', detail: msg } };
+async function readGeminiMacKeychain() {
+  const source = 'keychain:gemini-cli-oauth';
+  const item = await readKeychainItem('gemini-cli-oauth');
+  if (item.status !== 'ok') {
+    return { ok: false, diag: { source, status: item.status, ...(item.detail ? { detail: item.detail } : {}) } };
   }
+  const oauth = parseGeminiOAuthPayload(item.value, 'gemini-cli', source);
+  if (!oauth) return { ok: false, diag: { source, status: 'malformed' } };
+  return { ok: true, oauth, diag: { source, status: 'ok' } };
 }
 
 function parseGeminiOAuthPayload(raw, defaultClientType = 'gemini-cli', sourcePath = null) {
@@ -318,7 +317,7 @@ function parseGeminiOAuthPayload(raw, defaultClientType = 'gemini-cli', sourcePa
   }
 }
 
-function readGeminiApiKey(pathsTried) {
+async function readGeminiApiKey(pathsTried) {
   const envKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
   if (envKey) {
     pathsTried.push({ source: 'env:GEMINI_API_KEY', status: 'ok' });
@@ -326,28 +325,20 @@ function readGeminiApiKey(pathsTried) {
   }
 
   if (process.platform === 'darwin') {
-    try {
-      const out = execFileSync(
-        '/usr/bin/security',
-        ['find-generic-password', '-s', 'gemini-cli-api-key', '-w'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 2000 }
-      ).trim();
-      if (out) {
-        try {
-          const parsed = JSON.parse(out);
-          const k = parsed?.token?.accessToken || parsed?.apiKey || parsed?.key;
-          if (k && typeof k === 'string') {
-            pathsTried.push({ source: 'keychain:gemini-cli-api-key', status: 'ok' });
-            return k.trim();
-          }
-        } catch {
-          pathsTried.push({ source: 'keychain:gemini-cli-api-key', status: 'ok' });
-          return out;
-        }
+    const source = 'keychain:gemini-cli-api-key';
+    const item = await readKeychainItem('gemini-cli-api-key');
+    if (item.status === 'ok' && item.value) {
+      let key = item.value;
+      try {
+        const parsed = JSON.parse(item.value);
+        key = parsed?.token?.accessToken || parsed?.apiKey || parsed?.key || null;
+      } catch { /* plain string key */ }
+      if (typeof key === 'string' && key) {
+        pathsTried.push({ source, status: 'ok' });
+        return key.trim();
       }
-    } catch {
-      pathsTried.push({ source: 'keychain:gemini-cli-api-key', status: 'not_found' });
     }
+    pathsTried.push({ source, status: item.status === 'ok' ? 'malformed' : item.status });
   }
 
   const home = os.homedir();

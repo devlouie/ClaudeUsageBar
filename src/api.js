@@ -1,47 +1,84 @@
 const https = require('https');
+const { version } = require('../package.json');
 
-function fetchUsage(accessToken) {
+const USER_AGENT = `ClaudeUsageBar/${version}`;
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+// One HTTP exchange. It always settles. A dropped connection, a response cut off
+// mid-body, and a stalled socket all resolve to { ok: false }. A promise that
+// never settles here would freeze the poller until the app restarts.
+function request({ hostname, port, path, method = 'GET', headers = {}, body, timeoutMs = DEFAULT_TIMEOUT_MS, transport = https }) {
   return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'api.anthropic.com',
-      path: '/api/oauth/usage',
-      method: 'GET',
+    let settled = false;
+    let deadline = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    };
+    const fail = (err) => finish({ ok: false, error: err.message, code: err.code });
+
+    const payload = body == null ? null : JSON.stringify(body);
+    const req = transport.request({
+      hostname,
+      port,
+      path,
+      method,
       headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': 'ClaudeUsageBar/2.0',
         Accept: 'application/json',
+        'User-Agent': USER_AGENT,
+        ...(payload == null ? {} : {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        }),
+        ...headers,
       },
-      timeout: 10_000,
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        const retryAfter = parseRetryAfter(res.headers['retry-after']);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve({ ok: true, data: JSON.parse(body) });
-          } catch {
-            resolve({ ok: false, status: res.statusCode, error: 'parse-error' });
-          }
-        } else {
-          resolve({
-            ok: false,
-            status: res.statusCode,
-            error: body.slice(0, 200),
-            retryAfterMs: retryAfter,
-          });
-        }
+      res.on('error', fail);
+      res.on('end', () => finish(toResult(res, Buffer.concat(chunks).toString('utf8'))));
+      res.on('close', () => {
+        if (!res.complete) fail(Object.assign(new Error('connection closed'), { code: 'ECONNRESET' }));
       });
     });
-    req.on('error', (err) => resolve({ ok: false, error: err.message, code: err.code }));
-    req.on('timeout', () => {
+    req.on('error', fail);
+    deadline = setTimeout(() => {
+      finish({ ok: false, error: 'timeout' });
       req.destroy();
-      resolve({ ok: false, error: 'timeout' });
-    });
+    }, timeoutMs);
+    if (payload != null) req.write(payload);
     req.end();
   });
+}
+
+function toResult(res, text) {
+  const status = res.statusCode;
+  if (status >= 200 && status < 300) {
+    try {
+      return { ok: true, status, data: JSON.parse(text), headers: res.headers };
+    } catch {
+      return { ok: false, status, error: 'parse-error', headers: res.headers };
+    }
+  }
+  return {
+    ok: false,
+    status,
+    error: errorText(text),
+    retryAfterMs: parseRetryAfter(res.headers['retry-after']),
+    headers: res.headers,
+  };
+}
+
+// The readable part of an error body. Empty for an HTML error page.
+function errorText(text) {
+  try {
+    const data = JSON.parse(text);
+    const message = data?.error?.message || data?.message || data?.error;
+    if (typeof message === 'string') return message.slice(0, 200);
+  } catch {}
+  return text.trimStart().startsWith('<') ? '' : text.slice(0, 200);
 }
 
 // Retry-After can be seconds or an HTTP-date. Returns ms or null.
@@ -52,6 +89,17 @@ function parseRetryAfter(value) {
   const when = Date.parse(value);
   if (Number.isFinite(when)) return Math.max(0, when - Date.now());
   return null;
+}
+
+function fetchUsage(accessToken) {
+  return request({
+    hostname: 'api.anthropic.com',
+    path: '/api/oauth/usage',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -94,50 +142,8 @@ function getPlatformEnum() {
   return 'PLATFORM_UNSPECIFIED';
 }
 
-function postJson(hostname, reqPath, body, headers = {}, timeoutMs = 10_000) {
-  return new Promise((resolve) => {
-    const payload = JSON.stringify(body || {});
-    const req = https.request({
-      hostname,
-      path: reqPath,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        Accept: 'application/json',
-        ...headers,
-      },
-      timeout: timeoutMs,
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
-        const retryAfter = parseRetryAfter(res.headers['retry-after']);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve({ ok: true, status: res.statusCode, data: JSON.parse(text), headers: res.headers });
-          } catch {
-            resolve({ ok: false, status: res.statusCode, error: 'parse-error' });
-          }
-        } else {
-          resolve({
-            ok: false,
-            status: res.statusCode,
-            error: text.slice(0, 200),
-            retryAfterMs: retryAfter,
-          });
-        }
-      });
-    });
-    req.on('error', (err) => resolve({ ok: false, error: err.message, code: err.code }));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, error: 'timeout' });
-    });
-    req.write(payload);
-    req.end();
-  });
+function postJson(hostname, path, body, headers = {}) {
+  return request({ hostname, path, method: 'POST', body: body || {}, headers });
 }
 
 async function refreshGeminiAccessToken(oauth) {
@@ -204,49 +210,31 @@ async function fetchCodeAssistHost(hostname, accessToken) {
   };
 }
 
-function probeGeminiApiKey(apiKey) {
-  return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'generativelanguage.googleapis.com',
-      path: '/v1beta/models?pageSize=5',
-      method: 'GET',
-      headers: {
-        'x-goog-api-key': apiKey,
-        'User-Agent': 'ClaudeUsageBar/2.1',
-        Accept: 'application/json',
-      },
-      timeout: 8_000,
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const limitReq = Number(res.headers['x-ratelimit-limit-requests'] || res.headers['x-ratelimit-limit']);
-        const remReq = Number(res.headers['x-ratelimit-remaining-requests'] || res.headers['x-ratelimit-remaining']);
-        const limitTok = Number(res.headers['x-ratelimit-limit-tokens']);
-        const remTok = Number(res.headers['x-ratelimit-remaining-tokens']);
-        const rateLimits = {};
-        if (Number.isFinite(limitReq) && limitReq > 0 && Number.isFinite(remReq)) {
-          rateLimits.requestsUtilization = Math.max(0, Math.min(100, ((limitReq - remReq) / limitReq) * 100));
-        }
-        if (Number.isFinite(limitTok) && limitTok > 0 && Number.isFinite(remTok)) {
-          rateLimits.tokensUtilization = Math.max(0, Math.min(100, ((limitTok - remTok) / limitTok) * 100));
-        }
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ ok: true, status: 'valid', rateLimits });
-        } else if (res.statusCode === 429) {
-          resolve({ ok: true, status: 'throttled', rateLimits: { ...rateLimits, requestsUtilization: 100 } });
-        } else {
-          resolve({ ok: false, status: 'invalid', httpStatus: res.statusCode });
-        }
-      });
-    });
-    req.on('error', () => resolve({ ok: false, status: 'offline' }));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, status: 'timeout' });
-    });
-    req.end();
+async function probeGeminiApiKey(apiKey) {
+  const res = await request({
+    hostname: 'generativelanguage.googleapis.com',
+    path: '/v1beta/models?pageSize=5',
+    headers: { 'x-goog-api-key': apiKey },
+    timeoutMs: 8_000,
   });
+  if (res.status == null) return { ok: false, status: res.error === 'timeout' ? 'timeout' : 'offline' };
+
+  const h = res.headers || {};
+  const limitReq = Number(h['x-ratelimit-limit-requests'] || h['x-ratelimit-limit']);
+  const remReq = Number(h['x-ratelimit-remaining-requests'] || h['x-ratelimit-remaining']);
+  const limitTok = Number(h['x-ratelimit-limit-tokens']);
+  const remTok = Number(h['x-ratelimit-remaining-tokens']);
+  const rateLimits = {};
+  if (Number.isFinite(limitReq) && limitReq > 0 && Number.isFinite(remReq)) {
+    rateLimits.requestsUtilization = Math.max(0, Math.min(100, ((limitReq - remReq) / limitReq) * 100));
+  }
+  if (Number.isFinite(limitTok) && limitTok > 0 && Number.isFinite(remTok)) {
+    rateLimits.tokensUtilization = Math.max(0, Math.min(100, ((limitTok - remTok) / limitTok) * 100));
+  }
+
+  if (res.status >= 200 && res.status < 300) return { ok: true, status: 'valid', rateLimits };
+  if (res.status === 429) return { ok: true, status: 'throttled', rateLimits: { ...rateLimits, requestsUtilization: 100 } };
+  return { ok: false, status: 'invalid', httpStatus: res.status };
 }
 
 function fractionToPercent(remainingFraction) {
@@ -344,21 +332,16 @@ function mergeGeminiHostResults(results, apiKeyProbe) {
   const thirdParty5h = summaryBuckets.get('3p-5h') || null;
   const thirdPartyWeekly = summaryBuckets.get('3p-weekly') || null;
 
-  // If only API key is used (no OAuth), map API key rate limit utilization if available
+  // API key rate limits only count when the key reports them. A window Google
+  // did not report stays null, so the UI hides it rather than showing a false 0%.
   const apiKeyUtil = apiKeyProbe?.rateLimits?.requestsUtilization
     ?? apiKeyProbe?.rateLimits?.tokensUtilization
-    ?? 0;
+    ?? null;
+  const fiveHour = gem5h || (apiKeyUtil != null ? { utilization: apiKeyUtil, resets_at: null } : null);
 
-  const fiveHour = gem5h || (apiKeyProbe?.ok ? { utilization: apiKeyUtil, resets_at: null } : { utilization: 0, resets_at: null });
-  const sevenDay = gemWeekly || { utilization: 0, resets_at: null };
-
-  // Pro and Flash 5h fall back to gem5h if model-level buckets aren't differentiated
-  const proFiveHour = proBucket
-    ? { utilization: proBucket.utilization, resets_at: proBucket.resets_at || fiveHour.resets_at }
-    : { utilization: fiveHour.utilization, resets_at: fiveHour.resets_at };
-  const flashFiveHour = flashBucket
-    ? { utilization: flashBucket.utilization, resets_at: flashBucket.resets_at || fiveHour.resets_at }
-    : { utilization: fiveHour.utilization, resets_at: fiveHour.resets_at };
+  const modelWindow = (bucket) => (bucket
+    ? { utilization: bucket.utilization, resets_at: bucket.resets_at || fiveHour?.resets_at || null }
+    : null);
 
   const availableCredits = paidTier?.availableCredits || currentTier?.availableCredits || [];
 
@@ -366,9 +349,9 @@ function mergeGeminiHostResults(results, apiKeyProbe) {
     ok: true,
     data: {
       five_hour: fiveHour,
-      seven_day: sevenDay,
-      pro_five_hour: proFiveHour,
-      flash_five_hour: flashFiveHour,
+      seven_day: gemWeekly,
+      pro_five_hour: modelWindow(proBucket),
+      flash_five_hour: modelWindow(flashBucket),
       third_party_five_hour: thirdParty5h,
       third_party_seven_day: thirdPartyWeekly,
       tierId: paidTier?.id || currentTier?.id || (apiKeyProbe?.ok ? 'api-key' : ''),
@@ -388,10 +371,12 @@ function mergeGeminiHostResults(results, apiKeyProbe) {
 async function fetchGeminiUsage({ oauth, apiKey } = {}) {
   let activeOauth = oauth || null;
   let refreshedOauth = null;
+  let triedRefresh = false;
 
   if (activeOauth) {
     const soonExpired = activeOauth.expiresAt && activeOauth.expiresAt < Date.now() + 60_000;
     if ((activeOauth.needsRefresh || soonExpired || !activeOauth.accessToken) && activeOauth.refreshToken) {
+      triedRefresh = true;
       const fresh = await refreshGeminiAccessToken(activeOauth);
       if (fresh) {
         activeOauth = fresh;
@@ -420,9 +405,9 @@ async function fetchGeminiUsage({ oauth, apiKey } = {}) {
 
   let [hostResults, apiKeyProbe] = await Promise.all(tasks);
 
-  // If OAuth returned 401/403 and we have a refresh token we haven't tried yet, refresh and retry once.
+  // If OAuth returned 401/403 and we haven't tried the refresh token yet, refresh and retry once.
   const allAuthFailed = hostResults.length > 0 && hostResults.every((r) => !r.ok && (r.status === 401 || r.status === 403));
-  if (allAuthFailed && activeOauth?.refreshToken && !refreshedOauth) {
+  if (allAuthFailed && activeOauth?.refreshToken && !triedRefresh) {
     const fresh = await refreshGeminiAccessToken(activeOauth);
     if (fresh && fresh.accessToken) {
       activeOauth = fresh;
@@ -436,4 +421,4 @@ async function fetchGeminiUsage({ oauth, apiKey } = {}) {
   return merged;
 }
 
-module.exports = { fetchUsage, fetchGeminiUsage, refreshGeminiAccessToken };
+module.exports = { request, fetchUsage, fetchGeminiUsage };

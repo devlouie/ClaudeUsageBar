@@ -1,8 +1,7 @@
-// Polling orchestration: local JSONL re-parse + Anthropic usage endpoint.
+// Polling orchestration: local JSONL re-parse + the provider usage endpoints.
 //
-// Throttling collapses to one timestamp + one counter (the previous design
-// had three overlapping vars (lastApiAttemptAt, apiCooldownUntil,
-// consecutiveErrors) doing roughly the same job):
+// One timer drives the API loop. Every refresh, whatever started it, re-arms
+// that timer when it ends. Throttling is one timestamp + one counter:
 //
 //   nextAutoAt    next time an auto-scheduled poll is eligible. On 429
 //                 Retry-After this also gates manual refresh (we set
@@ -11,9 +10,36 @@
 //                 exponential backoff multiplier.
 //
 // Manual refreshes can fire before `nextAutoAt` unless `hardLock` is set.
+// Only one refresh runs at a time, so a result is never handled twice.
 
-const { fetchUsage, fetchGeminiUsage } = require('./api');
-const { parseLocalLogsAsync, stop: stopWorker } = require('./localUsageClient');
+const api = require('./api');
+const logs = require('./localUsageClient');
+const { REASON } = require('./credentials');
+
+const LOCAL_INTERVAL_MS    = 30 * 1000;
+const API_INTERVAL_HIDDEN  = 5  * 60 * 1000;
+const API_INTERVAL_VISIBLE = 90 * 1000;
+const API_MIN_GAP_MS       = 45 * 1000;
+const API_MAX_BACKOFF_MS   = 15 * 60 * 1000;
+const API_FIRST_FETCH_DELAY_MS = 400;
+const NET_RETRY_MS         = 30 * 1000;
+const NET_MAX_RETRY_MS     = 5 * 60 * 1000;
+const WAKE_DELAY_MS        = 5 * 1000; // the network needs a moment after sleep
+const TIMER_SLOP_MS        = 100;      // timers can fire a hair early
+
+const OFFLINE_CODES = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'ENETDOWN', 'EHOSTUNREACH',
+  'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
+]);
+
+function describeFailure(result, name) {
+  if (result.status === 429) return `${name} API throttled. Using local data.`;
+  if (result.status >= 500) return `${name} API unavailable (${result.status}).`;
+  if (result.error === 'timeout') return `${name} request timed out.`;
+  if (result.status == null && OFFLINE_CODES.has(result.code)) return 'Offline.';
+  if (result.error) return `${name} API error: ${result.error}`;
+  return `${name} API error (HTTP ${result.status ?? '?'}).`;
+}
 
 function createPoller({
   state,
@@ -22,219 +48,195 @@ function createPoller({
   getGeminiCreds = () => null,
   setGeminiCreds = () => {},
   loadCredentials,
-  loadGeminiCredentials = () => {},
+  loadGeminiCredentials = async () => {},
   pushToWindow,
   refreshTray,
   popupVisible,
+  fetchUsage = api.fetchUsage,
+  fetchGeminiUsage = api.fetchGeminiUsage,
+  parseLogs = logs.parseLocalLogsAsync,
+  stopLogs = logs.stop,
 }) {
-  const LOCAL_INTERVAL_MS    = 30 * 1000;
-  const API_INTERVAL_HIDDEN  = 5  * 60 * 1000;
-  const API_INTERVAL_VISIBLE = 90 * 1000;
-  const API_MIN_GAP_MS       = 45 * 1000;
-  const API_MAX_BACKOFF_MS   = 15 * 60 * 1000;
-  const API_FIRST_FETCH_DELAY_MS = 400;
-
   let apiTimer = null;
   let localTimer = null;
-  let inflight = null;
-  let geminiInflight = null;
+  let wakeTimer = null;
+  let stopped = false;
+  let running = null;      // the refresh in flight, if any
+  let runningApi = false;  // that refresh is fetching, or was asked to
   let nextAutoAt = 0;
-  let hardLock = false;        // set on 429. Blocks manual too
+  let lastApiAt = 0;
+  let hardLock = false;    // set on 429. Blocks manual too
   let errorStep = 0;
 
-  function validDate(d) {
-    if (!d) return null;
+  function notify() {
+    try {
+      pushToWindow();
+      refreshTray();
+    } catch (e) {
+      console.warn('[poller] notify failed:', e.message);
+    }
+  }
+
+  function validDate(iso) {
+    if (!iso) return null;
+    const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? null : d;
   }
 
-  async function refreshLocal() {
-    const sessionResetAt = state.usage?.five_hour?.resets_at
-      ? new Date(state.usage.five_hour.resets_at) : null;
-    const weeklyResetAt = state.usage?.seven_day?.resets_at
-      ? new Date(state.usage.seven_day.resets_at) : null;
-    const geminiSessionResetAt = state.geminiUsage?.five_hour?.resets_at
-      ? new Date(state.geminiUsage.five_hour.resets_at) : null;
-    const geminiWeeklyResetAt = state.geminiUsage?.seven_day?.resets_at
-      ? new Date(state.geminiUsage.seven_day.resets_at) : null;
-
-    const logs = await parseLocalLogsAsync({
-      provider: 'both',
-      sessionResetAt: validDate(sessionResetAt),
-      weeklyResetAt: validDate(weeklyResetAt),
-      geminiSessionResetAt: validDate(geminiSessionResetAt),
-      geminiWeeklyResetAt: validDate(geminiWeeklyResetAt),
-    });
-    if (logs && logs.claude && logs.gemini) {
-      state.localCosts = logs.claude;
-      state.geminiLocalCosts = logs.gemini;
-    } else {
-      state.localCosts = logs;
-    }
-    if (state.geminiLocalCosts && state.geminiLocalCosts.monthTokens > 0 && !state.geminiHasLoaded && !getGeminiCreds()?.ok) {
-      state.geminiHasLoaded = true;
-    }
-    state.lastUpdated = new Date();
-    pushToWindow();
-    await refreshTray();
+  function resetKey() {
+    return `${state.usage?.five_hour?.resets_at}|${state.geminiUsage?.five_hour?.resets_at}`;
   }
 
-  async function refresh({ forceSource = false, manual = false } = {}) {
-    state.isLoading = true;
-    pushToWindow();
+  // Never rejects. A bad tick keeps the last numbers and the loop carries on.
+  async function refreshLocal() {
+    try {
+      const parsed = await parseLogs({
+        sessionResetAt: validDate(state.usage?.five_hour?.resets_at),
+        geminiSessionResetAt: validDate(state.geminiUsage?.five_hour?.resets_at),
+      });
+      state.localCosts = parsed.claude;
+      state.geminiLocalCosts = parsed.gemini;
+      // Local spend is worth showing even before a provider answers.
+      if (parsed.claude.monthTokens > 0) state.hasLoaded = true;
+      if (parsed.gemini.monthTokens > 0) state.geminiHasLoaded = true;
+    } catch (e) {
+      console.warn('[poller] local parse failed:', e.message);
+    }
+    notify();
+  }
 
-    if (forceSource || !getToken()) loadCredentials();
-    if (forceSource || !getGeminiCreds()?.ok) loadGeminiCredentials();
+  function refresh(opts = {}) {
+    if (running) {
+      // A forced re-read, or a manual press during a local-only pass, still
+      // needs its own run. Anything else shares the run in flight.
+      const needsOwnRun = opts.forceSource || (opts.manual && !runningApi);
+      return needsOwnRun ? running.then(() => refresh(opts)) : running;
+    }
+    runningApi = Boolean(opts.manual || opts.forceSource);
+    running = runRefresh(opts)
+      .catch((e) => console.warn('[poller] refresh failed:', e.message))
+      .finally(() => {
+        running = null;
+        runningApi = false;
+        state.isLoading = false;
+        notify();
+        scheduleApiPoll();
+      });
+    return running;
+  }
+
+  async function runRefresh({ forceSource = false, manual = false }) {
+    // A locked keychain prompts the user on every read. Only retry when asked.
+    const shouldRead = (missing, credError) =>
+      forceSource || (missing && (manual || credError?.reason !== REASON.LOCKED_KEYCHAIN));
+    await Promise.all([
+      shouldRead(!getToken(), state.credentialError) ? loadCredentials() : null,
+      shouldRead(!getGeminiCreds()?.ok, state.geminiCredentialError) ? loadGeminiCredentials() : null,
+    ]);
 
     const hasClaude = Boolean(getToken());
     const gemCreds = getGeminiCreds();
-    const hasGemini = Boolean(gemCreds && gemCreds.ok);
+    const hasGemini = Boolean(gemCreds?.ok);
 
-    if (!hasClaude && !hasGemini) {
-      errorStep += 1;
-      await refreshLocal();
-      state.isLoading = false;
-      pushToWindow();
-      await refreshTray();
-      return;
-    }
-
-    const now = Date.now();
-    const waitMs = nextAutoAt - now;
     // Auto polls always wait. Manual polls skip the soft wait but still
     // respect a hard lock (429 Retry-After).
-    const skipApi = waitMs > 0 && (manual ? hardLock : true);
-
-    if (skipApi) {
+    const waiting = nextAutoAt - Date.now() > TIMER_SLOP_MS && (manual ? hardLock : true);
+    if ((!hasClaude && !hasGemini) || waiting) {
       await refreshLocal();
-      state.isLoading = false;
-      pushToWindow();
       return;
     }
 
-    if (hasClaude && !inflight) {
-      inflight = fetchUsage(getToken()).finally(() => { inflight = null; });
-    }
-    if (hasGemini && !geminiInflight) {
-      geminiInflight = fetchGeminiUsage(gemCreds).finally(() => { geminiInflight = null; });
-    }
+    runningApi = true;
+    lastApiAt = Date.now();
+    state.isLoading = true;
+    notify();
 
-    const hadResetWindows = Boolean(
-      state.usage?.five_hour?.resets_at && state.geminiUsage?.five_hour?.resets_at
-    );
-
+    const resetsBefore = resetKey();
     const [apiResult, geminiResult] = await Promise.all([
-      hasClaude ? inflight : Promise.resolve(null),
-      hasGemini ? geminiInflight : Promise.resolve(null),
+      hasClaude ? fetchClaude() : null,
+      hasGemini ? fetchGeminiUsage(gemCreds) : null,
       refreshLocal(),
     ]);
 
     if (apiResult) handleApiResult(apiResult);
-    if (geminiResult) handleGeminiApiResult(geminiResult);
+    if (geminiResult) await handleGeminiResult(geminiResult);
+    updateThrottle(apiResult || geminiResult);
 
-    if (!hadResetWindows && (apiResult?.ok || geminiResult?.ok)) {
-      await refreshLocal();
-    }
-
-    state.isLoading = false;
-    pushToWindow();
-    await refreshTray();
+    // Session totals are measured from the reset time, so a new one means
+    // the local numbers we just parsed used the wrong window.
+    if (resetKey() !== resetsBefore) await refreshLocal();
   }
 
-  function handleGeminiApiResult(geminiResult) {
-    if (geminiResult.refreshedOauth) {
-      const prev = getGeminiCreds();
-      if (prev) setGeminiCreds({ ...prev, oauth: geminiResult.refreshedOauth });
-    }
-    if (geminiResult.ok) {
-      state.geminiUsage = geminiResult.data;
-      state.geminiHasLoaded = true;
-      state.geminiErrorMessage = null;
-      if (!getToken()) onSuccess();
-      return;
-    }
-    if (geminiResult.status === 401 || geminiResult.status === 403) {
-      loadGeminiCredentials();
-      state.geminiErrorMessage = 'Gemini token expired or unauthorized. Sign in again.';
-    } else if (geminiResult.status === 429) {
-      state.geminiErrorMessage = 'Gemini API throttled. Using local data.';
-    } else if (geminiResult.error === 'timeout') {
-      state.geminiErrorMessage = 'Gemini request timed out.';
-    } else if (geminiResult.code === 'ENOTFOUND' || geminiResult.code === 'EAI_AGAIN') {
-      state.geminiErrorMessage = 'Offline';
-    } else {
-      state.geminiErrorMessage = geminiResult.error
-        ? `Gemini API error: ${geminiResult.error}`
-        : `Gemini API error (HTTP ${geminiResult.status ?? '?'})`;
-    }
-    if (state.geminiLocalCosts && state.geminiLocalCosts.monthTokens > 0) {
-      state.geminiHasLoaded = true;
-    }
-    if (!getToken()) onError();
+  // Claude Code rotates its access token every few hours. A rejected token is
+  // usually just an old one, so re-read and retry right away with the new one.
+  async function fetchClaude() {
+    const previous = getToken();
+    const first = await fetchUsage(previous);
+    if (first.status !== 401 && first.status !== 403) return first;
+    setToken(null);
+    await loadCredentials();
+    const next = getToken();
+    return next && next !== previous ? fetchUsage(next) : first;
   }
 
-  function handleApiResult(apiResult) {
-    if (apiResult.ok) {
-      state.usage = apiResult.data;
+  function handleApiResult(result) {
+    if (result.ok) {
+      state.usage = result.data;
       state.hasLoaded = true;
+      state.lastUpdated = new Date();
       state.errorMessage = null;
-      onSuccess();
-      return;
+    } else if (result.status === 401 || result.status === 403) {
+      // A failed re-read has already set the more specific message.
+      if (!state.credentialError) state.errorMessage = 'Token rejected. Open Claude Code to sign in again.';
+    } else {
+      state.errorMessage = describeFailure(result, 'Anthropic');
     }
+  }
 
-    if (apiResult.status === 401 || apiResult.status === 403) {
-      const previous = getToken();
-      setToken(null);
-      loadCredentials();
-      if (getToken() && getToken() !== previous) {
-        // Fresh token on disk. Treat like recovery so next poll fires soon.
-        state.errorMessage = 'Re-read credentials; retrying soon.';
-        onSuccess();
-      } else {
-        state.errorMessage = getToken()
-          ? 'Token rejected. Open Claude Code to sign in again.'
-          : 'Token expired. Open Claude Code to sign in again.';
-        onError();
-      }
-      return;
+  async function handleGeminiResult(result) {
+    if (result.refreshedOauth) {
+      const prev = getGeminiCreds();
+      if (prev) setGeminiCreds({ ...prev, oauth: result.refreshedOauth });
     }
+    if (result.ok) {
+      state.geminiUsage = result.data;
+      state.geminiHasLoaded = true;
+      state.geminiLastUpdated = new Date();
+      state.geminiErrorMessage = null;
+    } else if (result.status === 401 || result.status === 403) {
+      await loadGeminiCredentials();
+      state.geminiErrorMessage = 'Gemini token expired or unauthorized. Sign in again.';
+    } else {
+      state.geminiErrorMessage = describeFailure(result, 'Gemini');
+    }
+  }
 
-    if (apiResult.status === 429) {
-      // Honour Retry-After if present; else exponential backoff.
-      const explicit = Number.isFinite(apiResult.retryAfterMs) ? apiResult.retryAfterMs : null;
-      const backoff = explicit != null
-        ? Math.max(API_MIN_GAP_MS, explicit)
-        : exponentialBackoff();
-      nextAutoAt = Date.now() + backoff;
+  // The primary provider sets the pace, so both share one request budget.
+  function updateThrottle(result) {
+    const now = Date.now();
+    if (result.ok) {
+      errorStep = 0;
+      hardLock = false;
+      nextAutoAt = now + baseCadenceMs();
+    } else if (result.status === 429) {
+      // Honour Retry-After as a floor. Repeat 429s still back off.
+      const explicit = Number.isFinite(result.retryAfterMs) ? result.retryAfterMs : null;
+      const backoff = explicit == null
+        ? exponentialBackoff()
+        : Math.max(API_MIN_GAP_MS, explicit, errorStep > 0 ? exponentialBackoff() : 0);
+      nextAutoAt = now + backoff;
       hardLock = true;
       errorStep += 1;
-      state.errorMessage = 'API throttled. Using local data';
-      return;
-    }
-
-    if (apiResult.status >= 500) {
-      state.errorMessage = `Anthropic API unavailable (${apiResult.status}).`;
-    } else if (apiResult.error === 'timeout') {
-      state.errorMessage = 'Request timed out.';
-    } else if (apiResult.code === 'ENOTFOUND' || apiResult.code === 'EAI_AGAIN') {
-      state.errorMessage = 'Offline';
+    } else if (result.status == null) {
+      // No answer at all. Recovery should be quick, and retrying costs no quota.
+      errorStep += 1;
+      hardLock = false;
+      nextAutoAt = now + Math.min(NET_MAX_RETRY_MS, NET_RETRY_MS * 2 ** (errorStep - 1));
     } else {
-      state.errorMessage = apiResult.error
-        ? `API error: ${apiResult.error}`
-        : `API error (HTTP ${apiResult.status ?? '?'})`;
+      errorStep += 1;
+      hardLock = false; // soft errors don't block manual
+      nextAutoAt = now + exponentialBackoff();
     }
-    onError();
-  }
-
-  function onSuccess() {
-    errorStep = 0;
-    hardLock = false;
-    nextAutoAt = Date.now() + baseCadenceMs();
-  }
-
-  function onError() {
-    errorStep += 1;
-    hardLock = false; // soft errors don't block manual
-    nextAutoAt = Date.now() + exponentialBackoff();
   }
 
   function baseCadenceMs() {
@@ -245,22 +247,20 @@ function createPoller({
     const base = baseCadenceMs();
     if (errorStep === 0) return base;
     const exp = Math.min(errorStep, 5);
-    const backoff = Math.min(API_MAX_BACKOFF_MS, base * Math.pow(2, exp - 1));
+    const backoff = Math.min(API_MAX_BACKOFF_MS, base * 2 ** (exp - 1));
     const jitter = Math.random() * Math.min(5_000, backoff * 0.1);
     return backoff + jitter;
   }
 
   function scheduleApiPoll() {
-    if (apiTimer) clearTimeout(apiTimer);
-    const wait = Math.max(0, nextAutoAt - Date.now());
-    apiTimer = setTimeout(async () => {
-      await refresh();
-      scheduleApiPoll();
-    }, wait || baseCadenceMs());
+    if (stopped || running) return; // a running refresh re-arms when it ends
+    clearTimeout(apiTimer);
+    if (nextAutoAt <= Date.now()) nextAutoAt = Date.now() + baseCadenceMs();
+    apiTimer = setTimeout(() => refresh(), nextAutoAt - Date.now());
   }
 
   function scheduleLocalPoll() {
-    if (localTimer) clearTimeout(localTimer);
+    if (stopped) return;
     localTimer = setTimeout(async () => {
       await refreshLocal();
       scheduleLocalPoll();
@@ -268,36 +268,41 @@ function createPoller({
   }
 
   async function start() {
+    state.isLoading = true; // show the skeleton until the first API answer
     await refreshLocal();
     scheduleLocalPoll();
     // Defer the first API call so quick re-launches don't burst rate limits.
     nextAutoAt = Date.now() + API_FIRST_FETCH_DELAY_MS;
-    apiTimer = setTimeout(async () => {
-      await refresh();
-      scheduleApiPoll();
-    }, API_FIRST_FETCH_DELAY_MS);
-  }
-
-  function stop() {
-    if (apiTimer) clearTimeout(apiTimer);
-    if (localTimer) clearTimeout(localTimer);
-    apiTimer = null;
-    localTimer = null;
-    stopWorker();
-  }
-
-  // Called by main when the popup is toggled (cadence changes) or the system
-  // wakes from sleep. Re-anchors the auto schedule and triggers an immediate
-  // refresh on the user's behalf.
-  function nudge({ immediate = false } = {}) {
-    if (immediate) {
-      nextAutoAt = 0;
-      refresh({ manual: true });
-    }
     scheduleApiPoll();
   }
 
-  return { start, stop, refresh, refreshLocal, nudge };
+  function stop() {
+    stopped = true;
+    clearTimeout(apiTimer);
+    clearTimeout(localTimer);
+    clearTimeout(wakeTimer);
+    stopLogs();
+  }
+
+  // Opening the popup should show current numbers. The hidden cadence is
+  // 5 minutes, so pull the next poll forward to the minimum gap.
+  function popupOpened() {
+    if (!hardLock && errorStep === 0) {
+      nextAutoAt = Math.min(nextAutoAt, lastApiAt + API_MIN_GAP_MS);
+    }
+    return refresh();
+  }
+
+  // Timers do not fire during sleep. Refresh on wake once the network is back.
+  function wake() {
+    clearTimeout(wakeTimer);
+    wakeTimer = setTimeout(() => {
+      if (!hardLock) nextAutoAt = 0;
+      refresh();
+    }, WAKE_DELAY_MS);
+  }
+
+  return { start, stop, refresh, refreshLocal, popupOpened, wake };
 }
 
 module.exports = { createPoller };

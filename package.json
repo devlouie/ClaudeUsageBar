@@ -41,7 +41,7 @@
     "dist:win": "electron-builder --win",
     "dist:linux": "electron-builder --linux",
     "install:local": "electron-builder --dir && (killall ClaudeUsageBar 2>/dev/null || true) && rm -rf \"$HOME/Applications/ClaudeUsageBar.app\" && cp -R dist/mac-arm64/ClaudeUsageBar.app \"$HOME/Applications/ClaudeUsageBar.app\" && codesign --force --deep --sign - \"$HOME/Applications/ClaudeUsageBar.app\" && open -n \"$HOME/Applications/ClaudeUsageBar.app\"",
-    "test": "node test/localUsage.test.js"
+    "test": "node test/localUsage.test.js && node test/app.test.js"
   },
   "devDependencies": {
     "electron": "^44.9.0",

@@ -10,11 +10,11 @@
     UX intent for this redesign:
     1. Provider switcher tabs (Claude / Gemini / Combined) in the header.
     2. Headline = the worst-pressure limit, in giant numbers, with a pace verdict.
-    3. All four limits are visible as compact rows -- no Details disclosure for the headline numbers.
+    3. Every limit the provider reports is visible as a compact row. A limit it does not report has no row.
     4. Pace = actual % vs elapsed % shown as a tick on the session bar plus a projected-end glyph.
     5. Local-log data ("today / week / month tokens") is visually demoted with a tilde and dimmer color to mark it as approximate.
     6. Model breakdown is a single stacked proportional bar instead of a list of dots.
-    7. Errors when already-loaded are an inline soft strip, not a heavy banner. Loading is a stable skeleton -- no layout jump.
+    7. Errors when already-loaded are an inline soft strip, not a heavy banner. Loading is a stable skeleton, so the layout does not jump.
   -->
 </head>
 <body>
@@ -47,7 +47,7 @@
         <div class="row gap8 center">
           <button type="button" class="btn btn-primary" id="empty-retry">Re-check</button>
         </div>
-        <p class="state-hint muted">Esc to close</p>
+        <p class="state-hint muted">Esc to close &middot; Q to quit</p>
       </div>
 
       <!-- ============== HARD ERROR (never loaded successfully) ============== -->
@@ -59,7 +59,7 @@
           <button type="button" class="btn btn-primary" id="error-retry">Retry</button>
           <button type="button" class="btn" id="error-reread">Re-read credentials</button>
         </div>
-        <p class="state-hint muted">Esc to close &middot; &#8984;R to refresh</p>
+        <p class="state-hint muted">Esc to close &middot; R to refresh &middot; Q to quit</p>
       </div>
 
       <!-- ============== LOADING SKELETON (first load only) ============== -->
@@ -82,11 +82,10 @@
         <!-- Inline soft strip for stale-data error (only shown if already loaded once) -->
         <div id="stale" class="stale hidden" role="status"></div>
 
-        <!-- ===== HEADLINE: worst-pressure limit, big ===== -->
+        <!-- ===== HEADLINE: the limit under the most pressure, big ===== -->
         <section class="headline" id="headline">
           <div class="headline-top">
             <span class="headline-label" id="headline-label">Session</span>
-            <span class="headline-tag" id="headline-tag"></span>
           </div>
           <div class="headline-num">
             <span class="headline-pct" id="headline-pct">--</span>
@@ -107,35 +106,14 @@
           </div>
         </section>
 
-        <!-- ===== ALL FOUR LIMITS as compact rows (always visible) ===== -->
-        <section class="limits" aria-label="Usage limits">
-          <div class="limit-row" id="row-session" data-key="session" role="button" tabindex="0" aria-label="Pin row 1 as headline">
-            <span class="lr-name" id="name-session">Session</span>
-            <div class="lr-bar"><div class="lr-fill" id="bar-session"></div></div>
-            <span class="lr-pct" id="pct-session">--</span>
-          </div>
-          <div class="limit-row" id="row-weekly" data-key="weekly" role="button" tabindex="0" aria-label="Pin row 2 as headline">
-            <span class="lr-name" id="name-weekly">Weekly</span>
-            <div class="lr-bar"><div class="lr-fill" id="bar-weekly"></div></div>
-            <span class="lr-pct" id="pct-weekly">--</span>
-          </div>
-          <div class="limit-row" id="row-fable" data-key="fable" role="button" tabindex="0" aria-label="Pin row 3 as headline">
-            <span class="lr-name" id="name-fable">Fable <span class="lr-sub">7d</span></span>
-            <div class="lr-bar"><div class="lr-fill" id="bar-fable"></div></div>
-            <span class="lr-pct" id="pct-fable">--</span>
-          </div>
-          <div class="limit-row" id="row-opus" data-key="opus" role="button" tabindex="0" aria-label="Pin row 4 as headline">
-            <span class="lr-name" id="name-opus">Opus <span class="lr-sub">7d</span></span>
-            <div class="lr-bar"><div class="lr-fill" id="bar-opus"></div></div>
-            <span class="lr-pct" id="pct-opus">--</span>
-          </div>
-        </section>
+        <!-- ===== EVERY LIMIT as a compact row. Built by app.js from the snapshot. ===== -->
+        <section class="limits" id="limits" aria-label="Usage limits"></section>
 
         <!-- ===== LOCAL ACTIVITY (interactive period & daily price/usage filter) ===== -->
         <section class="local" id="local-section">
           <div class="local-head">
             <span class="local-title">Activity</span>
-            <button type="button" class="day-chip hidden" id="day-chip" title="Clear pinned day filter"></button>
+            <button type="button" class="day-chip hidden" id="day-chip" title="Clear pinned day"></button>
             <span class="local-approx" id="local-approx" title="Estimated from local logs">~ approx</span>
             <div class="metric-switch" role="group" aria-label="Comparison metric">
               <button type="button" class="metric-btn active" id="metric-cost" aria-pressed="true" title="Compare by estimated price ($)">$</button>

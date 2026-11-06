@@ -1,10 +1,13 @@
 // Regression tests for the incremental JSONL parser + model naming.
 // Run: node test/localUsage.test.js
 //
-// These pin the three bugs that made the parser slow or wrong:
+// These pin the bugs that made the parser slow or wrong:
 //   1. offset drift on a multi-byte UTF-8 char straddling a read chunk
 //   2. partial trailing lines being consumed before they're complete
 //   3. single-number model ids (claude-opus-5) failing to resolve a name
+//   4. streamed messages keeping their first, partial output count
+//   5. 7d and 30d stopping at Monday and the 1st of the month
+//   6. Antigravity CLI logs going unread, and "Gemini 3.8" cut to "Gemini 3"
 
 const os = require('os');
 const fs = require('fs');
@@ -19,10 +22,10 @@ const dir = path.join(TMP, '.claude', 'projects', 'proj');
 fs.mkdirSync(dir, { recursive: true });
 const FILE = path.join(dir, 's.jsonl');
 
-const { parseLocalLogs, parseGeminiLocalLogs, resetCache } = require('../src/localUsage');
+const { parseLocalLogs, parseGeminiLocalLogs, parseAllLogs, resetCache } = require('../src/localUsage');
 const { displayName, tier, cost } = require('../src/pricing');
 const { parseGeminiOAuthPayload } = require('../src/credentials');
-const { snapshotForRenderer, combinedWorstPercent } = require('../src/derivations');
+const { snapshotForRenderer, combinedWorstPercent, geminiLimits } = require('../src/derivations');
 
 let n = 0;
 function line(model, output, pad = '', usageExtra = {}) {
@@ -71,6 +74,8 @@ function check(name, fn) {
     'claude-fable-5-1': 'Fable 5.1',
     'claude-mythos-5-1': 'Mythos 5.1',
     'claude-opus-4-8': 'Opus 4.8',
+    'Claude Opus 5.5 (High)': 'Opus 5.5',
+    'Claude Sonnet 5.5 (Low)': 'Sonnet 5.5',
   };
   for (const [id, want] of Object.entries(names)) {
     check('displayName ' + id, () => assert.strictEqual(displayName(id), want));
@@ -98,6 +103,7 @@ function check(name, fn) {
     'claude-haiku-4-5-20251001': 'haiku45',
     'claude-3-5-haiku-20241022': 'haiku35',
     'claude-3-haiku-20240307': 'haiku3',
+    'Claude Opus 5.5 (High)': 'opus55',
   };
   for (const [id, want] of Object.entries(tiers)) {
     check('tier ' + id + ' = ' + want, () => assert.strictEqual(tier(id), want));
@@ -204,19 +210,96 @@ function check(name, fn) {
   for (const [id, want] of Object.entries(geminiNames)) {
     check('Gemini displayName ' + id, () => assert.strictEqual(displayName(id), want));
   }
-  check('Gemini tiers resolve pro / long / flash / lite / argon', () => {
-    assert.strictEqual(tier('MODEL_PLACEHOLDER_M417'), 'geminiArgon');
-    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 50_000 }), 'geminiPro');
-    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 250_000 }), 'geminiProLong');
-    assert.strictEqual(tier('gemini-3.8-flash'), 'geminiFlash');
-    assert.strictEqual(tier('gemini-2.5-flash-lite'), 'geminiFlashLite');
+  const nov = Date.UTC(2026, 10, 15);
+  check('Gemini tiers resolve by family, version, prompt length, and date', () => {
+    assert.strictEqual(tier('MODEL_PLACEHOLDER_M417', { at: nov }), 'geminiArgon');
+    assert.strictEqual(tier('Gemini 4 Argon (High)', { at: Date.UTC(2026, 11, 1) }), 'geminiArgonDec26');
+    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 50_000 }), 'geminiPro31');
+    assert.strictEqual(tier('gemini-3.1-pro-preview', { promptTokens: 250_000 }), 'geminiPro31Long');
+    assert.strictEqual(tier('gemini-2.5-pro', { promptTokens: 250_000 }), 'geminiPro25Long');
+    assert.strictEqual(tier('Gemini 3.8 Flash (Low)', { at: nov }), 'geminiFlash38');
+    assert.strictEqual(tier('gemini-3.8-flash', { at: Date.UTC(2027, 0, 1) }), 'geminiFlash38Jan27');
+    assert.strictEqual(tier('gemini-3-flash'), 'geminiFlash3');
+    assert.strictEqual(tier('gemini-2.5-flash'), 'geminiFlash25');
+    assert.strictEqual(tier('gemini-3.5-flash-lite'), 'geminiLite35');
+    assert.strictEqual(tier('gemini-3.1-flash-lite'), 'geminiLite31');
+    assert.strictEqual(tier('gemini-2.5-flash-lite'), 'geminiLite25');
   });
-  check('Gemini 3.1 Pro bills $1.25/M in (<=200k), $2.50/M in (>200k), $10/M out', () => {
-    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: 100_000 }), 0.125));
-    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: M }), 2.5));
-    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', output: 100_000 }), 1.0));
-    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', cacheRead: 100_000 }), 0.03125));
+  check('Gemini 4 Argon bills $2/$10/$0.10 until December, then $4/$20/$0.20', () => {
+    assert.ok(near(cost({ model: 'gemini-4-argon', input: M, at: nov }), 2));
+    assert.ok(near(cost({ model: 'gemini-4-argon', output: M, at: nov }), 10));
+    assert.ok(near(cost({ model: 'gemini-4-argon', cacheRead: M, at: nov }), 0.10));
+    assert.ok(near(cost({ model: 'gemini-4-argon', output: M, at: Date.UTC(2026, 11, 2) }), 20));
   });
+  check('Gemini 3.8 Flash bills $0.75/$3.75, not Pro rates', () => {
+    assert.ok(near(cost({ model: 'Gemini 3.8 Flash (Low)', input: M, at: nov }), 0.75));
+    assert.ok(near(cost({ model: 'Gemini 3.8 Flash (Low)', output: M, at: nov }), 3.75));
+  });
+  check('Gemini 3.1 Pro bills $2/M in (<=200k), $4/M in (>200k), $12/M out', () => {
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: 100_000 }), 0.2));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', input: M }), 4));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', output: 100_000 }), 1.2));
+    assert.ok(near(cost({ model: 'gemini-3.1-pro-preview', cacheRead: 100_000 }), 0.02));
+  });
+
+  // --- Streamed Claude messages -------------------------------------------
+  // One message, three lines. Only the last has the real output count.
+  const streamed = (id, output, ts = new Date().toISOString()) => JSON.stringify({
+    type: 'assistant',
+    timestamp: ts,
+    message: {
+      id,
+      model: 'claude-opus-5-5',
+      usage: { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    },
+  }) + '\n';
+
+  fs.writeFileSync(FILE, streamed('s1', 3) + streamed('s1', 3) + streamed('s1', 500));
+  resetCache();
+  const grown = await parseLocalLogs({});
+  check('streamed message counts its final output, once', () => {
+    assert.strictEqual(grown.monthTokens, 510);
+    assert.ok(near(grown.todayCost, (10 * 4 + 500 * 20) / M), 'got ' + grown.todayCost);
+    assert.strictEqual(grown.modelBreakdown['Opus 5.5'], grown.todayCost);
+  });
+
+  fs.appendFileSync(FILE, streamed('s2', 1));
+  await parseLocalLogs({});
+  fs.appendFileSync(FILE, streamed('s2', 200));
+  const tail = await parseLocalLogs({ sessionResetAt: new Date(Date.now() + 3_600_000) });
+  check('final count landing on a later tick still raises the total', () => {
+    assert.strictEqual(tail.monthTokens, 510 + 210);
+    assert.strictEqual(tail.sessionUsage.output, 700);
+  });
+
+  const OTHER = path.join(dir, 'resumed.jsonl');
+  fs.writeFileSync(OTHER, streamed('s2', 200) + streamed('s2', 900));
+  const across = await parseLocalLogs({});
+  check('a resumed session in another file raises the same message, not a copy', () =>
+    assert.strictEqual(across.monthTokens, 510 + 910));
+  fs.rmSync(OTHER);
+  await parseLocalLogs({});
+
+  // --- Rolling windows ----------------------------------------------------
+  const daysAgo = (d) => {
+    const x = new Date();
+    return new Date(x.getFullYear(), x.getMonth(), x.getDate() - d, 12).toISOString();
+  };
+  fs.writeFileSync(FILE,
+    streamed('r0', 90, daysAgo(0)) +
+    streamed('r6', 90, daysAgo(6)) +
+    streamed('r7', 90, daysAgo(7)) +
+    streamed('r29', 90, daysAgo(29)) +
+    streamed('r30', 90, daysAgo(30)));
+  resetCache();
+  const rolling = await parseLocalLogs({});
+  check('today, 7d, and 30d are rolling windows', () => {
+    assert.strictEqual(rolling.todayTokens, 100);
+    assert.strictEqual(rolling.weekTokens, 200);
+    assert.strictEqual(rolling.monthTokens, 400);
+    assert.strictEqual(Object.keys(rolling.daily).length, 4);
+  });
+  fs.rmSync(FILE);
 
   // --- Gemini local log parsing (Antigravity + Gemini CLI) ----------------
   const agyDir = path.join(TMP, '.gemini', 'antigravity', 'brain', 'conv-1', '.system_generated', 'logs');
@@ -240,6 +323,27 @@ function check(name, fn) {
     }) + '\n'
   );
 
+  const agyCliDir = path.join(TMP, '.gemini', 'antigravity-cli', 'brain', 'conv-2', '.system_generated', 'logs');
+  fs.mkdirSync(path.join(agyCliDir, 'chunks'), { recursive: true });
+  const planner = (step, input) => JSON.stringify({
+    step_index: step, type: 'PLANNER_RESPONSE', created_at: nowIso,
+    input_tokens: input, cache_read_tokens: 0, output_tokens: 0,
+  }) + '\n';
+  fs.writeFileSync(path.join(agyCliDir, 'transcript.jsonl'),
+    JSON.stringify({
+      step_index: 1, type: 'USER_INPUT', created_at: nowIso,
+      content: 'The user changed setting `Model Selection` from None to Gemini 3.8 Flash (Low). No need to comment on this change if the user does not ask.',
+    }) + '\n' +
+    planner(2, 1000) +
+    JSON.stringify({
+      step_index: 3, type: 'USER_INPUT', created_at: nowIso,
+      content: 'The user changed setting `Model Selection` from Gemini 3.8 Flash (Low) to Claude Opus 5.5 (High). No need to comment on this change if the user does not ask.',
+    }) + '\n' +
+    planner(4, 1000));
+  // These repeat the same steps. Reading them would double count.
+  fs.writeFileSync(path.join(agyCliDir, 'transcript_full.jsonl'), planner(2, 1000));
+  fs.writeFileSync(path.join(agyCliDir, 'chunks', 'part.jsonl'), planner(2, 1000));
+
   const cliChatDir = path.join(TMP, '.gemini', 'tmp', 'proj-hash', 'chats');
   fs.mkdirSync(cliChatDir, { recursive: true });
   const cliChatFile = path.join(cliChatDir, 'session-1.jsonl');
@@ -259,6 +363,16 @@ function check(name, fn) {
     assert.ok(gemLogs.todayTokens > 1250, 'expected > 1250 tokens, got ' + gemLogs.todayTokens);
     assert.ok('Gemini 4 Argon' in gemLogs.modelBreakdown, 'expected Gemini 4 Argon in breakdown');
     assert.ok('Gemini 2.5 Pro' in gemLogs.modelBreakdown, 'expected Gemini 2.5 Pro in breakdown');
+  });
+  check('Antigravity CLI logs are read once, under the model each step used', () => {
+    assert.strictEqual(gemLogs.monthModelTokens['Gemini 3.8 Flash'], 1000);
+    assert.strictEqual(gemLogs.monthModelTokens['Opus 5.5'], 1000);
+    assert.ok(!('Gemini 3 Pro' in gemLogs.modelBreakdown));
+  });
+  const both = await parseAllLogs({});
+  check('parseAllLogs returns both providers', () => {
+    assert.ok(both.claude && both.gemini);
+    assert.strictEqual(both.gemini.monthTokens, gemLogs.monthTokens);
   });
 
   // --- Gemini credentials & derivations -----------------------------------
@@ -301,8 +415,9 @@ function check(name, fn) {
     };
     assert.strictEqual(combinedWorstPercent(state), 62);
     const snap = snapshotForRenderer(state);
-    assert.strictEqual(snap.gemini.sessionPercent, 62);
-    assert.strictEqual(snap.gemini.weeklyPercent, 15);
+    const rows = Object.fromEntries(geminiLimits(state).map((r) => [r.key, r.percent]));
+    assert.deepStrictEqual(rows, { session: 62, weekly: 15, flash: 10 }); // pro repeats session
+    assert.strictEqual(snap.gemini.worstPercent, 62);
     assert.strictEqual(snap.gemini.planName, 'Google AI Ultra');
     assert.strictEqual(snap.combined.worstPercent, 62);
     assert.ok(snap.combined.localCosts.monthTokens >= gemLogs.monthTokens);

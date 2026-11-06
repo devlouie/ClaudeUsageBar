@@ -1,22 +1,22 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, screen, shell, powerMonitor } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, nativeTheme, ipcMain, screen, shell, powerMonitor } = require('electron');
 const path = require('path');
 
 const { readCredentials, readGeminiCredentials, REASON } = require('./src/credentials');
 const {
   snapshotForRenderer,
+  claudeLimits,
+  geminiLimits,
   sessionPercent,
-  weeklyPercent,
-  fablePercent,
-  opusPercent,
   geminiSessionPercent,
-  geminiWeeklyPercent,
   combinedWorstPercent,
 } = require('./src/derivations');
 const { createPoller } = require('./src/poller');
+const { drawTrayIcon } = require('./src/trayIcon');
+
+const isMac = process.platform === 'darwin';
 
 let tray = null;
 let popup = null;
-let iconRenderer = null;
 let cachedToken = null;
 let cachedGeminiCreds = null;
 
@@ -25,7 +25,7 @@ const state = {
   localCosts: null,
   subscriptionType: '',
   rateLimitTier: '',
-  lastUpdated: null,
+  lastUpdated: null,       // last successful Claude usage fetch
   errorMessage: null,
   // Typed credential failure surface. Null while creds are healthy.
   // Shape: { reason: REASON.*, pathsTried: [{source,status,detail?}] }
@@ -36,6 +36,7 @@ const state = {
   // Gemini subscription + API key + local log telemetry state
   geminiUsage: null,
   geminiLocalCosts: null,
+  geminiLastUpdated: null, // last successful Gemini usage fetch
   geminiErrorMessage: null,
   geminiCredentialError: null,
   geminiHasLoaded: false,
@@ -45,13 +46,13 @@ const CRED_ERROR_COPY = {
   [REASON.NOT_FOUND]:         'No Claude Code credentials found. Launch Claude Code and sign in.',
   [REASON.UNREADABLE]:        'Credentials file exists but couldn’t be read.',
   [REASON.MALFORMED]:         'Credentials file is unreadable or corrupt.',
-  [REASON.EXPIRED]:           'Token expired. Open Claude Code to sign in again.',
-  [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied. Click “Always Allow” on the prompt.',
+  [REASON.EXPIRED]:           'Token expired. Open Claude Code to refresh it.',
+  [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied. Press Re-check, then click “Always Allow”.',
   [REASON.PERMISSION_DENIED]: 'Permission denied reading credentials file.',
 };
 
 const GEMINI_CRED_ERROR_COPY = {
-  [REASON.NOT_FOUND]:         'No Gemini credentials found. Sign into Gemini CLI / Antigravity or set GEMINI_API_KEY.',
+  [REASON.NOT_FOUND]:         'No Gemini credentials found. Sign into Gemini CLI or Antigravity, or set GEMINI_API_KEY.',
   [REASON.UNREADABLE]:        'Gemini credentials file exists but couldn’t be read.',
   [REASON.MALFORMED]:         'Gemini credentials file is unreadable or corrupt.',
   [REASON.EXPIRED]:           'Gemini token expired. Open Gemini CLI or Antigravity to sign in again.',
@@ -59,8 +60,8 @@ const GEMINI_CRED_ERROR_COPY = {
   [REASON.PERMISSION_DENIED]: 'Permission denied reading Gemini credentials file.',
 };
 
-function loadCredentials() {
-  const result = readCredentials();
+async function loadCredentials() {
+  const result = await readCredentials();
   if (result.ok) {
     cachedToken = result.oauth.accessToken;
     state.subscriptionType = result.oauth.subscriptionType || '';
@@ -73,8 +74,8 @@ function loadCredentials() {
   state.errorMessage = CRED_ERROR_COPY[result.reason] || 'Could not read Claude Code credentials.';
 }
 
-function loadGeminiCredentials() {
-  const result = readGeminiCredentials();
+async function loadGeminiCredentials() {
+  const result = await readGeminiCredentials();
   if (result.ok) {
     cachedGeminiCreds = result;
     state.geminiCredentialError = null;
@@ -86,7 +87,7 @@ function loadGeminiCredentials() {
 }
 
 function popupVisible() {
-  return !!(popup && !popup.isDestroyed() && popup.isVisible());
+  return Boolean(popup && !popup.isDestroyed() && popup.isVisible());
 }
 
 function pushToWindow() {
@@ -108,79 +109,39 @@ const poller = createPoller({
   popupVisible,
 });
 
-async function setupIconRenderer() {
-  iconRenderer = new BrowserWindow({
-    show: false,
-    width: 64, height: 64,
-    webPreferences: { contextIsolation: true, sandbox: true },
-  });
-  await iconRenderer.loadFile(path.join(__dirname, 'renderer', 'icon.html'));
-}
+// ---------------------------------------------------------------------------
+// Tray
+// ---------------------------------------------------------------------------
 
-// The drawn icon is 5 segments with a ~10-step partial fill, so the whole
-// 0-100% range collapses to a few dozen distinct bitmaps. Key the cache on
-// that quantised form and skip the render whenever it repeats.
-const iconCache = new Map();
-
-function iconKey(percent) {
-  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
-  const exact = (pct / 100) * 5;
-  let key = '';
-  for (let i = 0; i < 5; i++) {
-    const remaining = exact - i;
-    if (remaining >= 1) key += 'F';
-    else if (remaining > 0.05) key += String(Math.max(1, Math.round(10 * remaining)));
-    else key += '0';
-  }
-  return key;
-}
-
-async function makeTrayIcon(percent) {
-  if (!iconRenderer) return null;
-  const key = iconKey(percent);
-  const hit = iconCache.get(key);
-  if (hit) return hit;
-
-  const dataUrl = await iconRenderer.webContents.executeJavaScript(
-    `window.drawIcon(${percent}, 2)`
-  );
-  const buf = Buffer.from(dataUrl.split(',')[1], 'base64');
-  const img = nativeImage.createFromBuffer(buf, { scaleFactor: 2.0 });
-  if (process.platform === 'darwin') img.setTemplateImage(true);
-  iconCache.set(key, img);
+function trayImage(percent) {
+  // macOS tints template images itself. Other desktops need a contrasting colour.
+  const level = !isMac && nativeTheme.shouldUseDarkColors ? 255 : 0;
+  const { buffer, width, height, scaleFactor } = drawTrayIcon(percent, { level });
+  const img = nativeImage.createFromBitmap(buffer, { width, height, scaleFactor });
+  if (isMac) img.setTemplateImage(true);
   return img;
 }
 
-let lastIconKey = null;
+let lastIconStamp = null;
 let lastTitle = null;
 let lastTooltip = null;
 
-async function refreshTray() {
+function refreshTray() {
   if (!tray) return;
-  const anyLoaded = state.hasLoaded || state.geminiHasLoaded;
-  const percent = anyLoaded ? combinedWorstPercent(state) : 0;
 
-  const key = iconKey(percent);
-  if (key !== lastIconKey) {
-    try {
-      const img = await makeTrayIcon(percent);
-      if (img) {
-        tray.setImage(img);
-        lastIconKey = key;
-      }
-    } catch {}
+  const percent = Math.round(combinedWorstPercent(state));
+  const stamp = `${percent}:${nativeTheme.shouldUseDarkColors}`;
+  if (stamp !== lastIconStamp) {
+    tray.setImage(trayImage(percent));
+    lastIconStamp = stamp;
   }
 
-  let titleText = '--';
-  if (anyLoaded) {
-    const cStr = state.hasLoaded ? `${Math.round(sessionPercent(state))}%` : '--';
-    const gStr = state.geminiHasLoaded ? `${Math.round(geminiSessionPercent(state))}%` : '--';
-    titleText = `C ${cStr} · G ${gStr}`;
+  const title = buildTitle();
+  if (isMac && title !== lastTitle) {
+    tray.setTitle(' ' + title);
+    lastTitle = title;
   }
-  if (process.platform === 'darwin' && typeof tray.setTitle === 'function' && titleText !== lastTitle) {
-    tray.setTitle(' ' + titleText);
-    lastTitle = titleText;
-  }
+
   const tooltip = buildTooltip();
   if (tooltip !== lastTooltip) {
     tray.setToolTip(tooltip);
@@ -188,28 +149,60 @@ async function refreshTray() {
   }
 }
 
+function buildTitle() {
+  const parts = [];
+  if (state.usage) parts.push(`C ${Math.round(sessionPercent(state))}%`);
+  if (state.geminiUsage) parts.push(`G ${Math.round(geminiSessionPercent(state))}%`);
+  return parts.join(' · ') || '--';
+}
+
 function buildTooltip() {
-  if (!state.hasLoaded && !state.geminiHasLoaded) return 'Claude & Gemini Usage: loading…';
+  const describe = (name, rows) => `${name}: ${rows.map((r) => `${r.short} ${Math.round(r.percent)}%`).join(' · ')}`;
   const lines = [];
-  if (state.hasLoaded) {
-    const cParts = [
-      `Session: ${Math.round(sessionPercent(state))}%`,
-      `Weekly: ${Math.round(weeklyPercent(state))}%`,
-    ];
-    const fable = fablePercent(state);
-    if (fable > 0) cParts.push(`Fable (7d): ${Math.round(fable)}%`);
-    const opus = opusPercent(state);
-    if (opus > 0) cParts.push(`Opus (7d): ${Math.round(opus)}%`);
-    lines.push('Claude: ' + cParts.join(' · '));
+  const cRows = claudeLimits(state);
+  const gRows = geminiLimits(state);
+  if (cRows.length) lines.push(describe('Claude', cRows));
+  if (gRows.length) lines.push(describe('Gemini', gRows));
+  return lines.join('\n') || 'Claude & Gemini Usage: loading…';
+}
+
+function buildContextMenu() {
+  return Menu.buildFromTemplate([
+    { label: 'Open', click: () => togglePopup() },
+    { label: 'Refresh', click: () => poller.refresh({ manual: true }) },
+    { label: 'Re-read credentials', click: () => poller.refresh({ forceSource: true, manual: true }) },
+    { type: 'separator' },
+    { label: 'Open Anthropic console', click: () => shell.openExternal('https://console.anthropic.com/') },
+    { label: 'Open Google AI Studio', click: () => shell.openExternal('https://aistudio.google.com/') },
+    { type: 'separator' },
+    { label: 'Quit', role: 'quit' },
+  ]);
+}
+
+function setupTray() {
+  tray = new Tray(trayImage(0));
+  refreshTray();
+  tray.on('click', () => togglePopup());
+  if (process.platform === 'linux') {
+    // Most Linux desktops send no tray clicks. The menu is the only way in.
+    tray.setContextMenu(buildContextMenu());
+  } else {
+    tray.on('right-click', () => tray.popUpContextMenu(buildContextMenu()));
   }
-  if (state.geminiHasLoaded) {
-    const gParts = [
-      `Session: ${Math.round(geminiSessionPercent(state))}%`,
-      `Weekly: ${Math.round(geminiWeeklyPercent(state))}%`,
-    ];
-    lines.push('Gemini: ' + gParts.join(' · '));
-  }
-  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Popup
+// ---------------------------------------------------------------------------
+
+// Clicking the tray while the popup is open blurs it first, which hides it.
+// That same click must then close the popup, not open it again.
+const BLUR_CLICK_GUARD_MS = 250;
+let lastBlurHideAt = 0;
+
+function windowBackground() {
+  if (isMac) return '#00000000';
+  return nativeTheme.shouldUseDarkColors ? '#1c1c1e' : '#fcfcfd';
 }
 
 function createPopup() {
@@ -221,22 +214,36 @@ function createPopup() {
     resizable: false,
     movable: false,
     skipTaskbar: true,
-    alwaysOnTop: true,
     fullscreenable: false,
-    transparent: process.platform === 'darwin',
-    backgroundColor: process.platform === 'darwin' ? '#00000000' : '#1c1c1e',
+    transparent: isMac,
+    backgroundColor: windowBackground(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       nodeIntegration: false,
     },
   });
-  popup.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  popup.on('blur', () => {
-    if (popup && popup.isVisible()) popup.hide();
+  // Open on the current Space and over full-screen apps, like a menu.
+  popup.setAlwaysOnTop(true, 'pop-up-menu');
+  popup.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+
+  const page = path.join(__dirname, 'renderer', 'index.html');
+  const { webContents } = popup;
+  webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  webContents.on('will-navigate', (e) => e.preventDefault());
+  webContents.on('did-finish-load', () => pushToWindow());
+  webContents.on('render-process-gone', (_e, details) => {
+    if (details.reason !== 'clean-exit') popup.loadFile(page);
   });
-  popup.webContents.on('did-finish-load', () => pushToWindow());
+
+  popup.on('blur', () => {
+    if (popupVisible()) {
+      popup.hide();
+      lastBlurHideAt = Date.now();
+    }
+  });
+  popup.loadFile(page);
 }
 
 function positionPopup() {
@@ -251,7 +258,7 @@ function positionPopup() {
   let x, y;
   if (trayBounds.width > 0 && trayBounds.height > 0) {
     x = Math.round(trayBounds.x + trayBounds.width / 2 - winBounds.width / 2);
-    if (process.platform === 'darwin') {
+    if (isMac) {
       y = Math.round(trayBounds.y + trayBounds.height + 4);
     } else {
       const aboveTray = trayBounds.y - winBounds.height - 4;
@@ -272,89 +279,62 @@ function togglePopup() {
   if (!popup) return;
   if (popup.isVisible()) {
     popup.hide();
-    poller.nudge();
     return;
   }
+  if (Date.now() - lastBlurHideAt < BLUR_CLICK_GUARD_MS) return;
   positionPopup();
   popup.show();
   popup.focus();
   pushToWindow();
-  // Opening nudges a refresh; throttle guards still apply.
-  poller.refresh();
-  poller.nudge();
+  poller.popupOpened();
 }
 
-function buildContextMenu() {
-  return Menu.buildFromTemplate([
-    { label: 'Open', click: () => togglePopup() },
-    { label: 'Refresh', click: () => poller.refresh({ manual: true }) },
-    { label: 'Re-read credentials', click: () => poller.refresh({ forceSource: true, manual: true }) },
-    { type: 'separator' },
-    { label: 'Open Anthropic console', click: () => shell.openExternal('https://console.anthropic.com/') },
-    { label: 'Open Google AI Studio', click: () => shell.openExternal('https://aistudio.google.com/') },
-    { type: 'separator' },
-    { label: 'Quit', role: 'quit' },
-  ]);
-}
+// ---------------------------------------------------------------------------
+// IPC
+// ---------------------------------------------------------------------------
 
-async function setupTray() {
-  const initial = (await makeTrayIcon(0)) || nativeImage.createEmpty();
-  tray = new Tray(initial);
-  tray.setToolTip('Claude Usage: loading…');
-  if (process.platform === 'darwin' && typeof tray.setTitle === 'function') {
-    tray.setTitle(' …');
-  }
-  tray.on('click', () => togglePopup());
-  tray.on('right-click', () => tray.popUpContextMenu(buildContextMenu()));
-  await refreshTray();
-}
-
-// IPC: handle() for anything that returns a value or whose completion the
-// renderer awaits; on() for fire-and-forget commands (no return → no point
-// paying for a promise round-trip).
+// handle() for anything that returns a value or whose completion the renderer
+// awaits; on() for fire-and-forget commands.
 ipcMain.handle('get-state', () => snapshotForRenderer(state));
 ipcMain.handle('refresh', () => poller.refresh({ manual: true }));
 ipcMain.handle('refresh-force', () => poller.refresh({ forceSource: true, manual: true }));
 
 ipcMain.on('hide', () => { if (popup) popup.hide(); });
 ipcMain.on('quit', () => app.quit());
-ipcMain.on('open-external', (_e, url) => {
-  let parsed;
-  try { parsed = new URL(String(url)); } catch { return; }
-  if (parsed.protocol !== 'https:') return;
-  shell.openExternal(parsed.toString());
-});
 ipcMain.on('set-height', (_e, h) => {
   if (!popup || popup.isDestroyed()) return;
-  const want = Math.max(220, Math.min(900, Math.round(Number(h) || 0)));
+  // A popup taller than the screen scrolls instead of running off the edge.
+  const maxHeight = screen.getDisplayMatching(popup.getBounds()).workArea.height - 8;
+  const want = Math.max(220, Math.min(maxHeight, Math.round(Number(h) || 0)));
   const [w] = popup.getSize();
   popup.setSize(w, want, false);
   if (popup.isVisible()) positionPopup();
 });
 
-app.on('window-all-closed', (e) => { e.preventDefault(); });
+// ---------------------------------------------------------------------------
+// App lifecycle
+// ---------------------------------------------------------------------------
 
-if (process.platform === 'darwin' && app.dock) {
-  app.dock.hide();
-}
+// A tray app stays alive with no windows open.
+app.on('window-all-closed', () => {});
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
+if (isMac && app.dock) app.dock.hide();
+
+if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => { if (popup) togglePopup(); });
+  app.on('second-instance', () => togglePopup());
 
   app.whenReady().then(async () => {
-    await setupIconRenderer();
     createPopup();
-    await setupTray();
-    loadCredentials();
-    loadGeminiCredentials();
+    setupTray();
+    nativeTheme.on('updated', () => {
+      if (popup && !popup.isDestroyed()) popup.setBackgroundColor(windowBackground());
+      refreshTray();
+    });
+    powerMonitor.on('resume', () => poller.wake());
     await poller.start();
-
-    // setTimeout doesn't fire during macOS sleep; force a refresh on wake.
-    powerMonitor.on('resume', () => poller.nudge({ immediate: true }));
-  });
+  }).catch((e) => console.error('[main] startup failed:', e));
 }
 
 app.on('before-quit', () => { poller.stop(); });

@@ -6,29 +6,15 @@
 // requests exactly as it would in-process.
 
 const { parentPort } = require('worker_threads');
-const { parseLocalLogs, parseGeminiLocalLogs } = require('./localUsage');
+const { parseAllLogs } = require('./localUsage');
 
-parentPort.on('message', async (msg) => {
-  const { id, provider, sessionResetAt, weeklyResetAt, geminiSessionResetAt, geminiWeeklyResetAt } = msg;
+const toDate = (iso) => (iso ? new Date(iso) : null);
+
+parentPort.on('message', async ({ id, sessionResetAt, geminiSessionResetAt }) => {
   try {
-    if (provider === 'both') {
-      const [claude, gemini] = await Promise.all([
-        parseLocalLogs({
-          sessionResetAt: sessionResetAt ? new Date(sessionResetAt) : null,
-          weeklyResetAt: weeklyResetAt ? new Date(weeklyResetAt) : null,
-        }),
-        parseGeminiLocalLogs({
-          sessionResetAt: geminiSessionResetAt ? new Date(geminiSessionResetAt) : null,
-          weeklyResetAt: geminiWeeklyResetAt ? new Date(geminiWeeklyResetAt) : null,
-        }),
-      ]);
-      parentPort.postMessage({ id, ok: true, summary: { claude, gemini } });
-      return;
-    }
-    const fn = provider === 'gemini' ? parseGeminiLocalLogs : parseLocalLogs;
-    const summary = await fn({
-      sessionResetAt: sessionResetAt ? new Date(sessionResetAt) : null,
-      weeklyResetAt: weeklyResetAt ? new Date(weeklyResetAt) : null,
+    const summary = await parseAllLogs({
+      sessionResetAt: toDate(sessionResetAt),
+      geminiSessionResetAt: toDate(geminiSessionResetAt),
     });
     parentPort.postMessage({ id, ok: true, summary });
   } catch (e) {

@@ -27,7 +27,6 @@ const els = {
   // headline
   headline: $('headline'),
   headlineLabel: $('headline-label'),
-  headlineTag: $('headline-tag'),
   headlinePct: $('headline-pct'),
   headlineVerdict: $('headline-verdict'),
   headlineBarFill: $('headline-bar-fill'),
@@ -36,23 +35,8 @@ const els = {
   headlineElapsed: $('headline-elapsed'),
   headlineReset: $('headline-reset'),
 
-  // rows
-  rowSession: $('row-session'),
-  rowWeekly: $('row-weekly'),
-  rowFable: $('row-fable'),
-  rowOpus: $('row-opus'),
-  nameSession: $('name-session'),
-  nameWeekly: $('name-weekly'),
-  nameFable: $('name-fable'),
-  nameOpus: $('name-opus'),
-  barSession: $('bar-session'),
-  barWeekly: $('bar-weekly'),
-  barFable: $('bar-fable'),
-  barOpus: $('bar-opus'),
-  pctSession: $('pct-session'),
-  pctWeekly: $('pct-weekly'),
-  pctFable: $('pct-fable'),
-  pctOpus: $('pct-opus'),
+  // limit rows
+  limits: $('limits'),
 
   // local
   localSection: $('local-section'),
@@ -69,7 +53,6 @@ const els = {
   costToday: $('cost-today'),
   costWeek: $('cost-week'),
   costMonth: $('cost-month'),
-  dailyCmp: $('daily-cmp'),
   dailyBars: $('daily-bars'),
   dailyMeta: $('daily-meta'),
   burnRow: $('burn-row'),
@@ -93,68 +76,63 @@ const els = {
   quit: $('quit'),
 };
 
+function loadPref(key, allowed, fallback) {
+  try {
+    const saved = localStorage.getItem(key);
+    if (allowed.includes(saved)) return saved;
+  } catch {}
+  return fallback;
+}
+
+function savePref(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+
+const PROVIDERS = ['claude', 'gemini', 'combined'];
+const PERIODS = ['today', 'week', 'month'];
+const METRICS = ['cost', 'tokens'];
+
 let lastSnapshot = null;
+let lastUpdatedIso = null;
 let updatedTimer = null;
-let activeProvider = (() => {
-  try {
-    const saved = localStorage.getItem('cub.provider');
-    if (saved === 'claude' || saved === 'gemini' || saved === 'combined') return saved;
-  } catch {}
-  return 'claude';
-})();
-// Per-provider pinned headline row key (null = auto = worst)
-const pinnedByProvider = { claude: null, gemini: null, combined: null };
-
-let activityPeriod = (() => {
-  try {
-    const saved = localStorage.getItem('cub.activityPeriod');
-    if (saved === 'today' || saved === 'week' || saved === 'month') return saved;
-  } catch {}
-  return 'month';
-})();
-
-let activityMetric = (() => {
-  try {
-    const saved = localStorage.getItem('cub.activityMetric');
-    if (saved === 'cost' || saved === 'tokens') return saved;
-  } catch {}
-  return 'cost';
-})();
-
+let hasChosenProvider = false;
+let activeProvider = loadPref('cub.provider', PROVIDERS, 'claude');
+let activityPeriod = loadPref('cub.activityPeriod', PERIODS, 'month');
+let activityMetric = loadPref('cub.activityMetric', METRICS, 'cost');
 let selectedDay = null; // 'YYYY-MM-DD' when a specific day bar is pinned
 let hoveredDay = null;  // 'YYYY-MM-DD' while hovering a day bar
 
+// Per-provider pinned headline row key (null = auto = highest)
+const pinnedByProvider = { claude: null, gemini: null, combined: null };
+
+function rerender() {
+  if (lastSnapshot) render(lastSnapshot);
+}
+
 function setActivityPeriod(period) {
-  if (period !== 'today' && period !== 'week' && period !== 'month') return;
   activityPeriod = period;
   selectedDay = null;
-  try { localStorage.setItem('cub.activityPeriod', period); } catch {}
-  if (lastSnapshot) render(lastSnapshot);
+  savePref('cub.activityPeriod', period);
+  rerender();
 }
 
 function setActivityMetric(metric) {
-  if (metric !== 'cost' && metric !== 'tokens') return;
   activityMetric = metric;
-  try { localStorage.setItem('cub.activityMetric', metric); } catch {}
-  if (lastSnapshot) render(lastSnapshot);
+  savePref('cub.activityMetric', metric);
+  rerender();
 }
 
 function setActiveProvider(p, { focusTab = false } = {}) {
-  if (p !== 'claude' && p !== 'gemini' && p !== 'combined') return;
   activeProvider = p;
-  try { localStorage.setItem('cub.provider', p); } catch {}
+  savePref('cub.provider', p);
   updateTabUI(focusTab);
-  if (lastSnapshot) render(lastSnapshot);
+  rerender();
 }
 
 function updateTabUI(focusTab = false) {
-  const tabs = [
-    { el: els.tabClaude, key: 'claude' },
-    { el: els.tabGemini, key: 'gemini' },
-    { el: els.tabCombined, key: 'combined' },
-  ];
-  for (const { el, key } of tabs) {
-    if (!el) continue;
+  const tabs = { claude: els.tabClaude, gemini: els.tabGemini, combined: els.tabCombined };
+  for (const key of PROVIDERS) {
+    const el = tabs[key];
     const isSel = key === activeProvider;
     el.classList.toggle('active', isSel);
     el.setAttribute('aria-selected', isSel ? 'true' : 'false');
@@ -162,6 +140,8 @@ function updateTabUI(focusTab = false) {
     if (focusTab && isSel) el.focus();
   }
 }
+
+// ============ FORMATTERS ============
 
 function statusClass(percent) {
   if (percent >= 80) return 'high';
@@ -176,16 +156,32 @@ function fmtPct(v) {
 
 function fmtTok(n) {
   if (n == null || !Number.isFinite(n)) return '--';
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return Math.round(n / 1_000) + 'K';
-  return String(n);
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'K';
+  return String(Math.round(n));
 }
 
 function fmtRate(tokPerMin) {
   if (tokPerMin == null) return '--';
-  if (tokPerMin <= 0) return '0/min';
-  if (tokPerMin >= 1000) return (tokPerMin / 1000).toFixed(1) + 'K/min';
-  return Math.round(tokPerMin) + '/min';
+  return fmtTok(Math.max(0, tokPerMin)) + '/min';
+}
+
+function fmtUsd(v) {
+  const n = Number(v) || 0;
+  if (n >= 100) return '$' + Math.round(n).toLocaleString('en-US');
+  if (n > 0 && n < 0.01) return '<$0.01';
+  return '$' + n.toFixed(2);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function capitalize(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
 }
 
 function modelColor(model) {
@@ -203,11 +199,9 @@ function modelColor(model) {
 }
 
 function relativeTime(iso) {
-  if (!iso) return '';
   const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return '';
-  const diff = Math.max(0, Date.now() - t);
-  const s = Math.floor(diff / 1000);
+  if (!iso || Number.isNaN(t)) return '';
+  const s = Math.floor(Math.max(0, Date.now() - t) / 1000);
   if (s < 5) return 'just now';
   if (s < 60) return s + 's ago';
   const m = Math.floor(s / 60);
@@ -217,15 +211,12 @@ function relativeTime(iso) {
   return Math.floor(h / 24) + 'd ago';
 }
 
-function verdictText(verdict, projectedPct, sessionPct, fiveHourResetIn) {
-  switch (verdict) {
+function verdictText(pace) {
+  switch (pace.verdict) {
     case 'burning':
-      if (projectedPct >= 100 && fiveHourResetIn) {
-        return 'Burning fast - on track to hit limit';
-      }
-      return 'Burning fast';
+      return pace.projectedPct >= 100 ? 'Burning fast. On track to hit the limit.' : 'Burning fast';
     case 'fast':
-      return 'Slightly ahead of pace';
+      return pace.projectedPct >= 100 ? 'Ahead of pace. On track to hit the limit.' : 'Ahead of pace';
     case 'pace':
       return 'On pace';
     case 'idle':
@@ -237,36 +228,42 @@ function verdictText(verdict, projectedPct, sessionPct, fiveHourResetIn) {
   }
 }
 
-let hasAutoSelectedProvider = false;
+function localDayKey(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
-function setBadge(badgeEl, hasLoaded, percent) {
-  if (!badgeEl) return;
-  badgeEl.classList.remove('high', 'med', 'low');
-  if (!hasLoaded || percent == null || !Number.isFinite(percent)) {
-    badgeEl.textContent = '--';
+function formatShortDate(dayKeyStr) {
+  const [y, m, d] = dayKeyStr.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+// ============ VIEW CONTEXT ============
+
+function setBadge(el, percent) {
+  el.classList.remove('badge-med', 'badge-high');
+  if (percent == null || !Number.isFinite(percent)) {
+    el.textContent = '--';
     return;
   }
   const cls = statusClass(percent);
-  badgeEl.classList.add(cls);
-  badgeEl.textContent = fmtPct(percent);
+  if (cls !== 'low') el.classList.add('badge-' + cls);
+  el.textContent = fmtPct(percent);
 }
 
 function updateTabBadges(snap) {
-  const cPct = snap.worstWindowPercent ?? snap.sessionPercent ?? 0;
-  const g = snap.gemini || {};
-  const gPct = g.worstWindowPercent ?? g.sessionPercent ?? 0;
-  const comb = snap.combined || {};
-  const combPct = comb.worstPercent ?? Math.max(cPct, gPct);
+  setBadge(els.tabBadgeClaude, snap.worstPercent);
+  setBadge(els.tabBadgeGemini, snap.gemini.worstPercent);
+  setBadge(els.tabBadgeCombined, snap.combined.worstPercent);
 
-  setBadge(els.tabBadgeClaude, snap.hasLoaded, cPct);
-  setBadge(els.tabBadgeGemini, Boolean(g.hasLoaded), gPct);
-  setBadge(els.tabBadgeCombined, Boolean(comb.hasLoaded || snap.hasLoaded || g.hasLoaded), combPct);
-
-  if (!hasAutoSelectedProvider && (snap.hasLoaded || g.hasLoaded || snap.errorMessage || g.errorMessage)) {
-    hasAutoSelectedProvider = true;
+  // First run with no saved tab: land on the provider that actually has data.
+  if (!hasChosenProvider && (snap.hasLoaded || snap.gemini.hasLoaded)) {
+    hasChosenProvider = true;
     let hasSaved = false;
     try { hasSaved = Boolean(localStorage.getItem('cub.provider')); } catch {}
-    if (!hasSaved && !snap.hasLoaded && snap.credentialError && g.hasLoaded) {
+    if (!hasSaved && !snap.hasLoaded && snap.gemini.hasLoaded) {
       activeProvider = 'gemini';
       updateTabUI(false);
     }
@@ -274,218 +271,83 @@ function updateTabBadges(snap) {
 }
 
 function buildViewContext(snap) {
-  const g = snap.gemini || {};
-  const c = snap.combined || {};
+  const g = snap.gemini;
+  const c = snap.combined;
 
   if (activeProvider === 'gemini') {
-    const fReset = g.fiveHourResetIn ? capitalize(g.fiveHourResetIn) : '';
-    const wReset = g.sevenDayResetIn ? capitalize(g.sevenDayResetIn) : '';
     return {
       provider: 'gemini',
-      hasLoaded: Boolean(g.hasLoaded),
-      isLoading: Boolean(g.isLoading ?? snap.isLoading),
-      errorMessage: g.errorMessage || null,
-      credentialError: g.credentialError || null,
-      emptyTitle: 'Sign in to Gemini / Antigravity',
-      rows: {
-        session: {
-          key: 'session',
-          label: 'Gemini 5h',
-          rowLabel: 'Session 5h',
-          tag: g.fiveHourResetIn || '',
-          resetText: fReset,
-          percent: g.sessionPercent ?? 0,
-          isSessionWindow: true,
-          elapsedPct: g.sessionElapsedPercent ?? 0,
-          projectedPct: g.projectedSessionPercent,
-          verdict: g.paceVerdict || 'pace',
-          fiveHourResetIn: g.fiveHourResetIn,
-        },
-        weekly: {
-          key: 'weekly',
-          label: 'Gemini 7d',
-          rowLabel: 'Weekly 7d',
-          tag: g.sevenDayResetIn || '',
-          resetText: wReset,
-          percent: g.weeklyPercent ?? 0,
-          isSessionWindow: false,
-        },
-        fable: {
-          key: 'fable',
-          label: 'Gemini Pro 5h',
-          rowLabel: 'Pro 5h',
-          tag: g.fiveHourResetIn || '',
-          resetText: fReset,
-          percent: g.proPercent ?? 0,
-          isSessionWindow: false,
-        },
-        opus: {
-          key: 'opus',
-          label: 'Gemini Flash 5h',
-          rowLabel: 'Flash 5h',
-          tag: g.fiveHourResetIn || '',
-          resetText: fReset,
-          percent: g.flashPercent ?? 0,
-          isSessionWindow: false,
-        },
-      },
-      localCosts: g.localCosts || null,
-      burnRate: g.burnRate ?? null,
-      extraUsage: g.extraUsage || null,
-      planName: g.planName || '--',
-      lastUpdated: snap.lastUpdated,
+      hasLoaded: g.hasLoaded,
+      isLoading: snap.isLoading,
+      errorMessage: g.errorMessage,
+      credentialError: g.credentialError,
+      emptyTitle: 'Sign in to Gemini or Antigravity',
+      rows: g.limits,
+      localCosts: g.localCosts,
+      burnRate: g.burnRate,
+      extraUsage: g.extraUsage,
+      planName: g.planName,
+      lastUpdated: g.lastUpdated,
     };
   }
 
   if (activeProvider === 'combined') {
-    const cfReset = snap.fiveHourResetIn ? capitalize(snap.fiveHourResetIn) : '';
-    const cwReset = snap.sevenDayResetIn ? capitalize(snap.sevenDayResetIn) : '';
-    const gfReset = g.fiveHourResetIn ? capitalize(g.fiveHourResetIn) : '';
-    const gwReset = g.sevenDayResetIn ? capitalize(g.sevenDayResetIn) : '';
-    const anyLoaded = Boolean(c.hasLoaded || snap.hasLoaded || g.hasLoaded);
-    const staleErr = (snap.errorMessage && g.errorMessage)
-      ? `${snap.errorMessage} · ${g.errorMessage}`
-      : (!anyLoaded ? (snap.errorMessage || g.errorMessage) : null);
+    // A provider that never loaded is noise here once the other one has data.
+    const errors = [];
+    if (snap.errorMessage && (snap.hasLoaded || !g.hasLoaded)) errors.push(snap.errorMessage);
+    if (g.errorMessage && (g.hasLoaded || !snap.hasLoaded)) errors.push(g.errorMessage);
     return {
       provider: 'combined',
-      hasLoaded: anyLoaded,
-      isLoading: Boolean(snap.isLoading),
-      errorMessage: staleErr,
-      credentialError: !anyLoaded ? (snap.credentialError || g.credentialError) : null,
+      hasLoaded: c.hasLoaded,
+      isLoading: snap.isLoading,
+      errorMessage: errors.join(' · ') || null,
+      credentialError: c.hasLoaded ? null : (snap.credentialError || g.credentialError),
       emptyTitle: 'Sign in to Claude or Gemini',
-      rows: {
-        session: {
-          key: 'session',
-          label: 'Claude Session',
-          rowLabel: 'Claude 5h',
-          tag: snap.fiveHourResetIn || '',
-          resetText: cfReset,
-          percent: snap.sessionPercent ?? 0,
-          isSessionWindow: true,
-          elapsedPct: snap.sessionElapsedPercent ?? 0,
-          projectedPct: snap.projectedSessionPercent,
-          verdict: snap.paceVerdict || 'pace',
-          fiveHourResetIn: snap.fiveHourResetIn,
-        },
-        weekly: {
-          key: 'weekly',
-          label: 'Claude Weekly',
-          rowLabel: 'Claude 7d',
-          tag: snap.sevenDayResetIn || '',
-          resetText: cwReset,
-          percent: snap.weeklyPercent ?? 0,
-          isSessionWindow: false,
-        },
-        fable: {
-          key: 'fable',
-          label: 'Gemini Session',
-          rowLabel: 'Gemini 5h',
-          tag: g.fiveHourResetIn || '',
-          resetText: gfReset,
-          percent: g.sessionPercent ?? 0,
-          isSessionWindow: true,
-          elapsedPct: g.sessionElapsedPercent ?? 0,
-          projectedPct: g.projectedSessionPercent,
-          verdict: g.paceVerdict || 'pace',
-          fiveHourResetIn: g.fiveHourResetIn,
-        },
-        opus: {
-          key: 'opus',
-          label: 'Gemini Weekly',
-          rowLabel: 'Gemini 7d',
-          tag: g.sevenDayResetIn || '',
-          resetText: gwReset,
-          percent: g.weeklyPercent ?? 0,
-          isSessionWindow: false,
-        },
-      },
-      localCosts: c.localCosts || null,
-      burnRate: c.burnRate ?? null,
-      extraUsage: snap.extraUsage || g.extraUsage || null,
-      planName: c.planName || '--',
-      lastUpdated: snap.lastUpdated,
+      rows: c.limits,
+      localCosts: c.localCosts,
+      burnRate: c.burnRate,
+      extraUsage: snap.extraUsage || g.extraUsage,
+      planName: c.planName,
+      lastUpdated: c.lastUpdated,
     };
   }
 
-  // Default: Claude
-  const fReset = snap.fiveHourResetIn ? capitalize(snap.fiveHourResetIn) : '';
-  const wReset = snap.sevenDayResetIn ? capitalize(snap.sevenDayResetIn) : '';
   return {
     provider: 'claude',
-    hasLoaded: Boolean(snap.hasLoaded),
-    isLoading: Boolean(snap.isLoading),
-    errorMessage: snap.errorMessage || null,
-    credentialError: snap.credentialError || null,
+    hasLoaded: snap.hasLoaded,
+    isLoading: snap.isLoading,
+    errorMessage: snap.errorMessage,
+    credentialError: snap.credentialError,
     emptyTitle: 'Sign in to Claude Code',
-    rows: {
-      session: {
-        key: 'session',
-        label: 'Session',
-        rowLabel: 'Session',
-        tag: snap.fiveHourResetIn || '',
-        resetText: fReset,
-        percent: snap.sessionPercent ?? 0,
-        isSessionWindow: true,
-        elapsedPct: snap.sessionElapsedPercent ?? 0,
-        projectedPct: snap.projectedSessionPercent,
-        verdict: snap.paceVerdict || 'pace',
-        fiveHourResetIn: snap.fiveHourResetIn,
-      },
-      weekly: {
-        key: 'weekly',
-        label: 'Weekly',
-        rowLabel: 'Weekly',
-        tag: snap.sevenDayResetIn || '',
-        resetText: wReset,
-        percent: snap.weeklyPercent ?? 0,
-        isSessionWindow: false,
-      },
-      fable: {
-        key: 'fable',
-        label: 'Fable 7d',
-        rowLabel: 'Fable',
-        tag: snap.sevenDayResetIn || '',
-        resetText: wReset,
-        percent: snap.fablePercent ?? 0,
-        isSessionWindow: false,
-      },
-      opus: {
-        key: 'opus',
-        label: 'Opus 7d',
-        rowLabel: 'Opus',
-        tag: snap.sevenDayResetIn || '',
-        resetText: wReset,
-        percent: snap.opusPercent ?? 0,
-        isSessionWindow: false,
-      },
-    },
-    localCosts: snap.localCosts || null,
-    burnRate: snap.burnRate ?? null,
-    extraUsage: snap.extraUsage || null,
-    planName: snap.planName || '--',
+    rows: snap.limits,
+    localCosts: snap.localCosts,
+    burnRate: snap.burnRate,
+    extraUsage: snap.extraUsage,
+    planName: snap.planName,
     lastUpdated: snap.lastUpdated,
   };
 }
 
 function pickHeadline(ctx) {
-  const candidates = ctx.rows;
   const pinned = pinnedByProvider[ctx.provider];
-  if (pinned && candidates[pinned]) return candidates[pinned];
-  const arr = Object.values(candidates);
-  arr.sort((a, b) => b.percent - a.percent);
-  return arr[0];
+  const pinnedRow = ctx.rows.find((r) => r.key === pinned);
+  if (pinnedRow) return pinnedRow;
+  return ctx.rows.reduce((best, r) => (!best || r.percent > best.percent ? r : best), null);
 }
+
+// ============ RENDER ============
 
 function render(snap) {
   lastSnapshot = snap;
   updateTabBadges(snap);
   updateTabUI(false);
   const ctx = buildViewContext(snap);
+  lastUpdatedIso = ctx.lastUpdated;
   if (!routeState(ctx)) return;
   renderStaleStrip(ctx);
   const head = pickHeadline(ctx);
   renderHeadline(ctx, head);
-  renderRows(ctx, head.key);
+  renderRows(ctx, head);
   renderLocal(ctx, head);
   renderExtra(ctx);
   renderFooter(ctx);
@@ -493,14 +355,14 @@ function render(snap) {
 }
 
 function routeState(ctx) {
-  if (!ctx.hasLoaded && !ctx.errorMessage && ctx.isLoading) {
+  const waiting = ctx.isLoading && !ctx.errorMessage;
+  if (waiting && !ctx.rows.length) {
     show('loading');
     return false;
   }
-  const isCredError = !!ctx.credentialError;
-  if (!ctx.hasLoaded && isCredError) {
+  if (!ctx.hasLoaded && ctx.credentialError) {
     show('empty');
-    if (els.emptyTitle) els.emptyTitle.textContent = ctx.emptyTitle;
+    els.emptyTitle.textContent = ctx.emptyTitle;
     els.emptyText.textContent = ctx.errorMessage;
     return false;
   }
@@ -517,215 +379,175 @@ function routeState(ctx) {
   return true;
 }
 
+function show(state) {
+  els.loading.classList.toggle('hidden', state !== 'loading');
+  els.empty.classList.toggle('hidden', state !== 'empty');
+  els.errorState.classList.toggle('hidden', state !== 'error');
+  els.content.classList.toggle('hidden', state !== 'content');
+}
+
 function renderStaleStrip(ctx) {
-  if (ctx.errorMessage) {
-    els.stale.textContent = ctx.errorMessage;
-    els.stale.classList.remove('hidden');
-  } else {
-    els.stale.classList.add('hidden');
-  }
+  els.stale.textContent = ctx.errorMessage || '';
+  els.stale.classList.toggle('hidden', !ctx.errorMessage);
 }
 
 function renderHeadline(ctx, head) {
-  const cls = statusClass(head.percent);
+  els.headline.classList.toggle('hidden', !head);
+  if (!head) return;
+
   els.headline.classList.remove('status-low', 'status-med', 'status-high');
-  els.headline.classList.add('status-' + cls);
+  els.headline.classList.add('status-' + statusClass(head.percent));
   els.headlineLabel.textContent = head.label;
-  els.headlineTag.textContent = head.tag || '';
-  els.headlineTag.style.display = head.tag ? '' : 'none';
   els.headlinePct.textContent = Math.round(head.percent);
   els.headlineBarFill.style.width = Math.min(100, Math.max(0, head.percent)) + '%';
+  els.headlineReset.textContent = capitalize(head.resetIn || '');
 
-  if (head.isSessionWindow) {
-    renderSessionTickAndProjection(head);
-    els.headlineReset.textContent = head.resetText || '';
-  } else {
-    els.headlineBarTick.style.display = 'none';
-    els.headlineBarProjected.classList.remove('active');
-    els.headlineElapsed.textContent = '';
-    els.headlineReset.textContent = head.resetText || '';
+  renderPaceMarkers(head);
+  renderVerdict(ctx, head);
+}
+
+function renderPaceMarkers(head) {
+  const elapsed = head.pace ? head.pace.elapsedPct : 0;
+  els.headlineBarTick.style.display = elapsed > 0 ? '' : 'none';
+  els.headlineElapsed.textContent = elapsed > 0 ? 'Window ' + Math.round(elapsed) + '% elapsed' : '';
+  if (elapsed > 0) els.headlineBarTick.style.left = elapsed + '%';
+
+  const proj = head.pace ? head.pace.projectedPct : null;
+  const showProj = proj != null && proj > head.percent + 1 && proj < 200 && elapsed > 5 && elapsed < 99;
+  if (showProj) els.headlineBarProjected.style.left = Math.min(100, proj) + '%';
+  els.headlineBarProjected.classList.toggle('active', Boolean(showProj));
+}
+
+function renderVerdict(ctx, head) {
+  const pinned = pinnedByProvider[ctx.provider] === head.key;
+  const verdict = head.pace ? head.pace.verdict : 'pace';
+  let text = head.pace ? verdictText(head.pace) : 'Highest limit right now';
+  if (!head.pace && pinned) text = 'Pinned';
+
+  const el = els.headlineVerdict;
+  el.className = 'headline-verdict verdict-' + verdict;
+  el.innerHTML = '<span class="verdict-dot"></span>' + escapeHtml(text);
+}
+
+function createRowEl(key) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'limit-row';
+  row.dataset.key = key;
+  row.innerHTML = '<span class="lr-name"></span>'
+    + '<span class="lr-bar"><span class="lr-fill"></span></span>'
+    + '<span class="lr-pct"></span>';
+  return row;
+}
+
+// Keyed so a bar keeps its element between renders and its width animates.
+function renderRows(ctx, head) {
+  const section = els.limits;
+  section.classList.toggle('hidden', ctx.rows.length === 0);
+  const existing = new Map([...section.children].map((el) => [el.dataset.key, el]));
+
+  ctx.rows.forEach((row, i) => {
+    const el = existing.get(row.key) || createRowEl(row.key);
+    existing.delete(row.key);
+    if (section.children[i] !== el) section.insertBefore(el, section.children[i] || null);
+    setRow(el, row, ctx, head && row.key === head.key);
+  });
+  for (const el of existing.values()) el.remove();
+}
+
+function setRow(el, row, ctx, isHead) {
+  const cls = statusClass(row.percent);
+  const name = el.children[0];
+  const fill = el.children[1].firstChild;
+  const pct = el.children[2];
+  const pinned = pinnedByProvider[ctx.provider] === row.key;
+
+  name.textContent = row.short;
+  el.title = row.resetIn ? `${row.label}: ${row.resetIn}` : row.label;
+  fill.style.width = Math.min(100, Math.max(0, row.percent)) + '%';
+  fill.className = 'lr-fill fill-' + cls;
+  pct.className = 'lr-pct pct-' + cls;
+  pct.textContent = fmtPct(row.percent);
+  el.classList.toggle('zero', row.percent <= 0);
+  el.classList.toggle('active', Boolean(isHead));
+  el.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+  el.setAttribute('aria-label', `${row.label} ${fmtPct(row.percent)}. ${pinned ? 'Unpin from' : 'Pin as'} headline.`);
+}
+
+function activitySelection(lc, daily) {
+  if (selectedDay && daily[selectedDay]) {
+    const d = daily[selectedDay];
+    return { cost: d.cost || 0, tokens: d.tokens || 0, costModels: d.models || {}, tokenModels: d.modelTokens || {}, label: null };
   }
-
-  renderVerdict(head);
-}
-
-function renderSessionTickAndProjection(head) {
-  const elapsed = Math.min(100, Math.max(0, head.elapsedPct || 0));
-  els.headlineBarTick.style.left = elapsed + '%';
-  els.headlineBarTick.style.display = '';
-  els.headlineElapsed.textContent = 'Window ' + Math.round(elapsed) + '% elapsed';
-
-  const proj = head.projectedPct;
-  const sessionPct = head.percent;
-  if (proj != null && proj > sessionPct + 1 && proj < 200 && elapsed > 5 && elapsed < 99) {
-    els.headlineBarProjected.style.left = Math.min(100, proj) + '%';
-    els.headlineBarProjected.classList.add('active');
-  } else {
-    els.headlineBarProjected.classList.remove('active');
+  if (activityPeriod === 'today') {
+    return { cost: lc.todayCost || 0, tokens: lc.todayTokens || 0, costModels: lc.todayModelBreakdown || {}, tokenModels: lc.todayModelTokens || {}, label: 'today' };
   }
-}
-
-let lastVerdictSig = null;
-
-function renderVerdict(head) {
-  const verdict = head.isSessionWindow ? (head.verdict || 'pace') : 'pace';
-  const text = head.isSessionWindow
-    ? verdictText(verdict, head.projectedPct, head.percent, head.fiveHourResetIn)
-    : 'Worst-pressure limit right now';
-  const sig = verdict + '\u0000' + text;
-  if (sig === lastVerdictSig) return;
-  lastVerdictSig = sig;
-
-  els.headlineVerdict.className = 'headline-verdict verdict-' + verdict;
-  els.headlineVerdict.innerHTML = '<span class="verdict-dot"></span>' + escapeHtml(text);
-}
-
-function renderRows(ctx, headKey) {
-  const r = ctx.rows;
-  if (els.nameSession) els.nameSession.textContent = r.session.rowLabel;
-  if (els.nameWeekly)  els.nameWeekly.textContent  = r.weekly.rowLabel;
-  if (els.nameFable)   els.nameFable.textContent   = r.fable.rowLabel;
-  if (els.nameOpus)    els.nameOpus.textContent    = r.opus.rowLabel;
-
-  setRow(els.rowSession, els.barSession, els.pctSession, r.session.percent, headKey === 'session');
-  setRow(els.rowWeekly,  els.barWeekly,  els.pctWeekly,  r.weekly.percent,  headKey === 'weekly');
-  setRow(els.rowFable,   els.barFable,   els.pctFable,   r.fable.percent,   headKey === 'fable');
-  setRow(els.rowOpus,    els.barOpus,    els.pctOpus,    r.opus.percent,    headKey === 'opus');
-}
-
-function fmtUsd(v) {
-  const n = Number(v) || 0;
-  if (n >= 100) return '$' + n.toFixed(0);
-  if (n >= 10) return '$' + n.toFixed(2);
-  if (n > 0 && n < 0.01) return '<$0.01';
-  return '$' + n.toFixed(2);
-}
-
-function localDayKey(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function formatShortDate(dayKeyStr) {
-  const [y, m, d] = dayKeyStr.split('-').map(Number);
-  const dt = new Date(y, m - 1, d);
-  return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  if (activityPeriod === 'week') {
+    return { cost: lc.weekCost || 0, tokens: lc.weekTokens || 0, costModels: lc.weekModelBreakdown || {}, tokenModels: lc.weekModelTokens || {}, label: '7d' };
+  }
+  return { cost: lc.monthCost || 0, tokens: lc.monthTokens || 0, costModels: lc.modelBreakdown || {}, tokenModels: lc.monthModelTokens || {}, label: '30d' };
 }
 
 function renderLocal(ctx, head) {
   const lc = ctx.localCosts;
-  if (!lc) {
-    els.localSection.classList.add('hidden');
-    return;
-  }
-  els.localSection.classList.remove('hidden');
+  els.localSection.classList.toggle('hidden', !lc);
+  if (!lc) return;
 
-  // Metric toggle UI
   const isCost = activityMetric === 'cost';
-  if (els.metricCost) {
-    els.metricCost.classList.toggle('active', isCost);
-    els.metricCost.setAttribute('aria-pressed', isCost ? 'true' : 'false');
-  }
-  if (els.metricTokens) {
-    els.metricTokens.classList.toggle('active', !isCost);
-    els.metricTokens.setAttribute('aria-pressed', !isCost ? 'true' : 'false');
-  }
+  els.metricCost.classList.toggle('active', isCost);
+  els.metricCost.setAttribute('aria-pressed', isCost ? 'true' : 'false');
+  els.metricTokens.classList.toggle('active', !isCost);
+  els.metricTokens.setAttribute('aria-pressed', !isCost ? 'true' : 'false');
 
-  // Period cards: show both tokens and dollar cost on every card, emphasizing active metric
-  const periods = [
+  // Validate selectedDay still exists in the current data.
+  const daily = lc.daily || {};
+  if (selectedDay && !daily[selectedDay]) selectedDay = null;
+
+  // Period cards show both tokens and dollars, with the active metric on top.
+  const cards = [
     { key: 'today', cell: els.cellToday, primaryEl: els.tokToday, subEl: els.costToday, tokens: lc.todayTokens || 0, cost: lc.todayCost || 0 },
     { key: 'week',  cell: els.cellWeek,  primaryEl: els.tokWeek,  subEl: els.costWeek,  tokens: lc.weekTokens || 0,  cost: lc.weekCost || 0 },
     { key: 'month', cell: els.cellMonth, primaryEl: els.tokMonth, subEl: els.costMonth, tokens: lc.monthTokens || 0, cost: lc.monthCost || 0 },
   ];
-  for (const p of periods) {
+  for (const p of cards) {
     const tokStr = '~' + fmtTok(p.tokens);
-    const costStr = '$' + p.cost.toFixed(2);
-    if (p.primaryEl) p.primaryEl.textContent = isCost ? costStr : tokStr;
-    if (p.subEl) p.subEl.textContent = isCost ? tokStr : costStr;
-    if (p.cell) {
-      const isAct = !selectedDay && activityPeriod === p.key;
-      p.cell.classList.toggle('active', isAct);
-      p.cell.setAttribute('aria-pressed', isAct ? 'true' : 'false');
-    }
+    const costStr = fmtUsd(p.cost);
+    p.primaryEl.textContent = isCost ? costStr : tokStr;
+    p.subEl.textContent = isCost ? tokStr : costStr;
+    const isAct = !selectedDay && activityPeriod === p.key;
+    p.cell.classList.toggle('active', isAct);
+    p.cell.setAttribute('aria-pressed', isAct ? 'true' : 'false');
   }
 
-  // Validate selectedDay still exists in current window
-  const daily = lc.daily || {};
-  if (selectedDay && !daily[selectedDay]) {
-    selectedDay = null;
-  }
+  // Day chip when a single day is pinned. It names the scope, so the summary
+  // beside it does not have to.
+  els.dayChip.classList.toggle('hidden', !selectedDay);
+  if (selectedDay) els.dayChip.textContent = formatShortDate(selectedDay) + ' ×';
 
-  // Day chip badge when a single day is pinned
-  if (els.dayChip) {
-    if (selectedDay) {
-      els.dayChip.textContent = formatShortDate(selectedDay) + ' \u00d7';
-      els.dayChip.classList.remove('hidden');
-    } else {
-      els.dayChip.classList.add('hidden');
-    }
-  }
-
-  // Determine filtered cost, tokens, and model breakdowns for active selection
-  let activeCost = lc.monthCost || 0;
-  let activeTokens = lc.monthTokens || 0;
-  let activeScopeLabel = '30d';
-  let activeCostModels = lc.modelBreakdown || {};
-  let activeTokenModels = lc.monthModelTokens || {};
-
-  if (selectedDay && daily[selectedDay]) {
-    const dBucket = daily[selectedDay];
-    activeCost = dBucket.cost || 0;
-    activeTokens = dBucket.tokens || 0;
-    activeScopeLabel = formatShortDate(selectedDay);
-    activeCostModels = dBucket.models || {};
-    activeTokenModels = dBucket.modelTokens || {};
-  } else if (activityPeriod === 'today') {
-    activeCost = lc.todayCost || 0;
-    activeTokens = lc.todayTokens || 0;
-    activeScopeLabel = 'today';
-    activeCostModels = lc.todayModelBreakdown || {};
-    activeTokenModels = lc.todayModelTokens || {};
-  } else if (activityPeriod === 'week') {
-    activeCost = lc.weekCost || 0;
-    activeTokens = lc.weekTokens || 0;
-    activeScopeLabel = '7d';
-    activeCostModels = lc.weekModelBreakdown || {};
-    activeTokenModels = lc.weekModelTokens || {};
-  }
-
-  if (els.localApprox) {
-    els.localApprox.textContent = `~$${activeCost.toFixed(2)} \u00b7 ~${fmtTok(activeTokens)} (${activeScopeLabel})`;
-  }
+  const sel = activitySelection(lc, daily);
+  const scope = sel.label ? ` (${sel.label})` : '';
+  els.localApprox.textContent = `~${fmtUsd(sel.cost)} · ~${fmtTok(sel.tokens)}${scope}`;
 
   renderDailyComparison(ctx, lc);
   renderBurnRow(ctx, head);
-  renderModelBar(activeCostModels, activeTokenModels);
+  renderModelBar(sel.costModels, sel.tokenModels);
 }
 
 let lastDailyBarsSig = null;
 
-function renderDailyComparison(ctx, lc) {
-  if (!els.dailyCmp || !els.dailyBars || !els.dailyMeta) return;
-  const daily = lc.daily || {};
-  const numDays = activityPeriod === 'month' ? 14 : 7;
+function buildDays(daily, numDays) {
   const now = new Date();
-  const todayKey = localDayKey(now);
-  const yesterdayDate = new Date(now);
-  yesterdayDate.setDate(now.getDate() - 1);
-  const yesterdayKey = localDayKey(yesterdayDate);
-
   const days = [];
   for (let i = numDays - 1; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(now.getDate() - i);
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
     const key = localDayKey(d);
-    const bucket = daily[key] || { tokens: 0, cost: 0, models: {}, modelTokens: {} };
+    const bucket = daily[key] || {};
+    const shortDate = formatShortDate(key);
     days.push({
       key,
       shortLabel: i === 0 ? 'Today' : String(d.getDate()),
-      fullLabel: i === 0 ? `Today (${formatShortDate(key)})` : (i === 1 ? `Yest (${formatShortDate(key)})` : formatShortDate(key)),
+      metaLabel: i === 0 ? 'Today' : (i === 1 ? 'Yesterday' : shortDate),
+      fullLabel: i === 0 ? `Today (${shortDate})` : (i === 1 ? `Yesterday (${shortDate})` : shortDate),
       cost: bucket.cost || 0,
       tokens: bucket.tokens || 0,
       claudeCost: bucket.claudeCost,
@@ -736,12 +558,38 @@ function renderDailyComparison(ctx, lc) {
       modelTokens: bucket.modelTokens || {},
     });
   }
+  return days;
+}
 
+function dayBarHtml(d, isCost, maxVal) {
+  const val = isCost ? d.cost : d.tokens;
+  const totalPct = val > 0 ? Math.max(8, Math.min(100, (val / maxVal) * 100)) : 0;
+  const entries = Object.entries(isCost ? d.models : d.modelTokens)
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1]);
+  const sum = entries.reduce((s, [, v]) => s + v, 0);
+
+  let segHtml = '';
+  if (totalPct > 0 && sum > 0) {
+    segHtml = entries.map(([m, v]) =>
+      `<div class="day-seg" style="height:${((v / sum) * totalPct).toFixed(1)}%;background:${modelColor(m)}"></div>`).join('');
+  } else if (totalPct > 0) {
+    segHtml = `<div class="day-seg" style="height:${totalPct.toFixed(1)}%;background:var(--accent)"></div>`;
+  }
+
+  const isAct = selectedDay === d.key;
+  const title = `${d.fullLabel}: ${fmtUsd(d.cost)} · ~${fmtTok(d.tokens)}`;
+  return `<button type="button" class="day-col${isAct ? ' active' : ''}" data-day="${d.key}" aria-pressed="${isAct ? 'true' : 'false'}" title="${escapeHtml(title)}">`
+    + `<div class="day-bar-track">${segHtml}</div>`
+    + `<span class="day-lbl">${escapeHtml(d.shortLabel)}</span>`
+    + '</button>';
+}
+
+function renderDailyComparison(ctx, lc) {
+  const daily = lc.daily || {};
+  const days = buildDays(daily, activityPeriod === 'month' ? 14 : 7);
   const isCost = activityMetric === 'cost';
-  const maxVal = Math.max(
-    1e-9,
-    ...days.map((d) => (isCost ? d.cost : d.tokens))
-  );
+  const maxVal = Math.max(1e-9, ...days.map((d) => (isCost ? d.cost : d.tokens)));
 
   const sig = [
     ctx.provider,
@@ -753,349 +601,209 @@ function renderDailyComparison(ctx, lc) {
 
   if (sig !== lastDailyBarsSig) {
     lastDailyBarsSig = sig;
-    els.dailyBars.innerHTML = days.map((d) => {
-      const val = isCost ? d.cost : d.tokens;
-      const totalPct = val > 0 ? Math.max(8, Math.min(100, (val / maxVal) * 100)) : 0;
-      const modelMap = isCost ? d.models : d.modelTokens;
-      const modelEntries = Object.entries(modelMap).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
-      const modelSum = modelEntries.reduce((s, [, v]) => s + v, 0);
-
-      let segHtml = '';
-      if (totalPct > 0 && modelSum > 0) {
-        segHtml = modelEntries.map(([m, mv]) => {
-          const h = (mv / modelSum) * totalPct;
-          return `<div class="day-seg" style="height:${h.toFixed(1)}%;background:${modelColor(m)}"></div>`;
-        }).join('');
-      } else if (totalPct > 0) {
-        segHtml = `<div class="day-seg" style="height:${totalPct.toFixed(1)}%;background:var(--blue)"></div>`;
-      }
-
-      const isAct = selectedDay === d.key;
-      const titleText = `${d.fullLabel}: $${d.cost.toFixed(2)} \u00b7 ~${fmtTok(d.tokens)}`;
-      return `<button type="button" class="day-col${isAct ? ' active' : ''}" data-day="${d.key}" aria-pressed="${isAct ? 'true' : 'false'}" title="${escapeHtml(titleText)}">` +
-        `<div class="day-bar-track">${segHtml}</div>` +
-        `<span class="day-lbl">${escapeHtml(d.shortLabel)}</span>` +
-        `</button>`;
-    }).join('');
-  } else {
-    // Keep active state synced even when bar heights haven't changed
-    const btns = els.dailyBars.querySelectorAll('.day-col');
-    for (const btn of btns) {
-      const isAct = btn.getAttribute('data-day') === selectedDay;
-      btn.classList.toggle('active', isAct);
-      btn.setAttribute('aria-pressed', isAct ? 'true' : 'false');
-    }
+    // Rebuilding the bars must not drop keyboard focus from the one in use.
+    const focusedDay = document.activeElement?.closest?.('.day-col')?.dataset.day;
+    els.dailyBars.innerHTML = days.map((d) => dayBarHtml(d, isCost, maxVal)).join('');
+    if (focusedDay) els.dailyBars.querySelector(`[data-day="${focusedDay}"]`)?.focus();
   }
 
-  // Daily comparison metadata row for hovered / selected / today
-  const focusKey = hoveredDay || selectedDay || todayKey;
-  const focusObj = days.find((d) => d.key === focusKey) || days[days.length - 1];
-  const leftText = `${focusObj.fullLabel}: $${focusObj.cost.toFixed(2)} \u00b7 ~${fmtTok(focusObj.tokens)}`;
-
-  // Compute comparison right-hand text:
-  // In Combined tab, show Claude vs Gemini split on that day; otherwise compare vs 7d daily avg / yesterday
-  let rightHtml = '';
-  if (ctx.provider === 'combined' && (focusObj.claudeCost != null || focusObj.geminiCost != null)) {
-    if (isCost) {
-      rightHtml = `C ${fmtUsd(focusObj.claudeCost || 0)} \u00b7 G ${fmtUsd(focusObj.geminiCost || 0)}`;
-    } else {
-      rightHtml = `C ~${fmtTok(focusObj.claudeTokens || 0)} \u00b7 G ~${fmtTok(focusObj.geminiTokens || 0)}`;
-    }
-  } else {
-    const last7 = days.slice(-7);
-    const avg7Cost = last7.reduce((s, d) => s + d.cost, 0) / Math.max(1, last7.length);
-    const avg7Tok = last7.reduce((s, d) => s + d.tokens, 0) / Math.max(1, last7.length);
-    const focusVal = isCost ? focusObj.cost : focusObj.tokens;
-    const avgVal = isCost ? avg7Cost : avg7Tok;
-    if (avgVal > 0 && focusVal > 0) {
-      const diffPct = Math.round(((focusVal - avgVal) / avgVal) * 100);
-      const sign = diffPct > 0 ? '+' : '';
-      const cls = diffPct > 15 ? 'up' : (diffPct < -15 ? 'down' : '');
-      const avgLabel = isCost ? fmtUsd(avg7Cost) : ('~' + fmtTok(avg7Tok));
-      rightHtml = `<span class="daily-delta ${cls}">${sign}${diffPct}%</span> vs 7d avg (${avgLabel}/d)`;
-    } else {
-      const yest = daily[yesterdayKey];
-      const yestLabel = isCost ? fmtUsd(yest?.cost || 0) : ('~' + fmtTok(yest?.tokens || 0));
-      rightHtml = `Yest: ${yestLabel}`;
-    }
-  }
+  const focusObj = days.find((d) => d.key === (hoveredDay || selectedDay)) || days[days.length - 1];
+  const leftText = `${focusObj.metaLabel}: ${fmtUsd(focusObj.cost)} · ~${fmtTok(focusObj.tokens)}`;
 
   els.dailyMeta.innerHTML =
-    `<span class="daily-meta-left">${escapeHtml(leftText)}</span>` +
-    `<span class="daily-meta-right">${rightHtml}</span>`;
+    `<span class="daily-meta-left">${escapeHtml(leftText)}</span>`
+    + `<span class="daily-meta-right">${dailyComparisonHtml(ctx, days, focusObj, isCost)}</span>`;
+}
+
+// Combined shows the Claude and Gemini split for the day. Single-provider tabs
+// compare the day with the 7-day average. Only formatter output reaches this
+// HTML, so nothing here needs escaping.
+function dailyComparisonHtml(ctx, days, focusObj, isCost) {
+  if (ctx.provider === 'combined') {
+    return isCost
+      ? `C ${fmtUsd(focusObj.claudeCost)} · G ${fmtUsd(focusObj.geminiCost)}`
+      : `C ~${fmtTok(focusObj.claudeTokens || 0)} · G ~${fmtTok(focusObj.geminiTokens || 0)}`;
+  }
+  const last7 = days.slice(-7);
+  const avg = last7.reduce((s, d) => s + (isCost ? d.cost : d.tokens), 0) / last7.length;
+  const val = isCost ? focusObj.cost : focusObj.tokens;
+  if (avg > 0 && val > 0) {
+    const diffPct = Math.round(((val - avg) / avg) * 100);
+    const cls = diffPct > 15 ? 'up' : (diffPct < -15 ? 'down' : '');
+    return `<span class="daily-delta ${cls}">${diffPct > 0 ? '+' : ''}${diffPct}%</span> vs 7d avg`;
+  }
+  return avg > 0 ? `7d avg ${isCost ? fmtUsd(avg) : '~' + fmtTok(avg)}/day` : '';
 }
 
 function renderBurnRow(ctx, head) {
-  if (ctx.burnRate == null) {
-    els.burnRow.classList.add('hidden');
-    return;
-  }
-  els.burnRow.classList.remove('hidden');
+  els.burnRow.classList.toggle('hidden', ctx.burnRate == null);
+  if (ctx.burnRate == null) return;
   els.burnVal.textContent = fmtRate(ctx.burnRate);
-  const proj = head.projectedPct;
-  if (proj != null && proj > 1 && head.isSessionWindow && (head.elapsedPct || 0) > 5) {
-    els.burnProjected.textContent = '-> ' + Math.round(Math.min(999, proj)) + '% by reset';
-    els.burnProjected.classList.remove('high', 'med');
-    if (proj >= 100) els.burnProjected.classList.add('high');
-    else if (proj >= 80) els.burnProjected.classList.add('med');
-  } else {
-    els.burnProjected.textContent = '';
-  }
+
+  const pace = head && head.pace;
+  const proj = pace ? pace.projectedPct : null;
+  const showProj = proj != null && proj > 1 && pace.elapsedPct > 5;
+  els.burnProjected.textContent = showProj ? '→ ' + Math.round(proj) + '% by reset' : '';
+  els.burnProjected.classList.toggle('high', Boolean(showProj && proj >= 100));
+  els.burnProjected.classList.toggle('med', Boolean(showProj && proj >= 80 && proj < 100));
 }
 
 function renderExtra(ctx) {
   const ex = ctx.extraUsage;
-  if (!ex || !ex.is_enabled) {
-    els.extraSection.classList.add('hidden');
-    return;
-  }
-  if (els.extraLabel) els.extraLabel.textContent = ex.label || 'Extra usage';
-  if (ex.used_credits != null && ex.monthly_limit != null && ex.monthly_limit > 0) {
-    els.extraSection.classList.remove('hidden');
-    if (els.extraBar) els.extraBar.classList.remove('hidden');
-    const pct = Math.min(100, (ex.used_credits / ex.monthly_limit) * 100);
-    els.extraFill.style.width = pct + '%';
-    els.extraVal.textContent = '$' + ex.used_credits.toFixed(2) + ' / $' + ex.monthly_limit.toFixed(2);
-  } else if (ex.display_text) {
-    els.extraSection.classList.remove('hidden');
-    if (els.extraBar) els.extraBar.classList.add('hidden');
-    els.extraVal.textContent = ex.display_text;
-  } else {
-    els.extraSection.classList.add('hidden');
-  }
+  els.extraSection.classList.toggle('hidden', !ex);
+  if (!ex) return;
+  els.extraLabel.textContent = ex.label;
+  els.extraVal.textContent = ex.text;
+  els.extraBar.classList.toggle('hidden', ex.percent == null);
+  if (ex.percent != null) els.extraFill.style.width = ex.percent + '%';
 }
 
 function renderFooter(ctx) {
   els.plan.textContent = ctx.planName || '--';
-  els.updated.textContent = relativeTime(ctx.lastUpdated);
-  els.refresh.classList.toggle('spinning', !!ctx.isLoading);
+  els.plan.title = ctx.planName || '';
+  renderUpdated();
+  els.refresh.classList.toggle('spinning', Boolean(ctx.isLoading));
 }
 
-// Tick the "Ns ago" footer once a second while visible. The renderer process
-// keeps running when the window is hidden, so we gate on visibilityState to
-// avoid a no-op DOM write every second forever.
+// How old the limit numbers are. Local spend refreshes on its own every 30s
+// and does not count, or the footer would say "just now" during an outage.
+function renderUpdated() {
+  els.updated.textContent = lastUpdatedIso ? 'Updated ' + relativeTime(lastUpdatedIso) : 'Local logs only';
+}
+
+// Tick the footer once a second while visible. The renderer process keeps
+// running when the window is hidden, so we gate on visibilityState to avoid a
+// no-op DOM write every second forever.
 function startUpdatedTicker() {
-  if (updatedTimer) clearInterval(updatedTimer);
-  if (document.visibilityState !== 'visible') return;
-  updatedTimer = setInterval(() => {
-    if (lastSnapshot) els.updated.textContent = relativeTime(lastSnapshot.lastUpdated);
-  }, 1000);
+  clearInterval(updatedTimer);
+  updatedTimer = null;
+  if (document.visibilityState === 'visible') updatedTimer = setInterval(renderUpdated, 1000);
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
-    if (updatedTimer) { clearInterval(updatedTimer); updatedTimer = null; }
-  } else if (lastSnapshot) {
-    render(lastSnapshot);
+    clearInterval(updatedTimer);
+    updatedTimer = null;
+  } else {
+    rerender();
   }
 });
 
-function setRow(rowEl, barEl, pctEl, percent, isActive) {
-  const cls = statusClass(percent);
-  barEl.style.width = Math.min(100, Math.max(0, percent)) + '%';
-  barEl.classList.remove('fill-low', 'fill-med', 'fill-high');
-  barEl.classList.add('fill-' + cls);
-  pctEl.classList.remove('pct-low', 'pct-med', 'pct-high');
-  pctEl.classList.add('pct-' + cls);
-  pctEl.textContent = fmtPct(percent);
-  rowEl.classList.toggle('zero', percent <= 0);
-  rowEl.classList.toggle('active', !!isActive);
-}
-
 let lastModelSig = null;
 
-function renderModelBar(costBreakdown = {}, tokenBreakdown = {}) {
+function renderModelBar(costBreakdown, tokenBreakdown) {
   const isCost = activityMetric === 'cost';
-  const primaryMap = isCost ? costBreakdown : tokenBreakdown;
-  const allModels = new Set([
-    ...Object.keys(costBreakdown || {}),
-    ...Object.keys(tokenBreakdown || {}),
-  ]);
+  const names = new Set([...Object.keys(costBreakdown), ...Object.keys(tokenBreakdown)]);
   const entries = [];
-  for (const m of allModels) {
-    const cVal = Number(costBreakdown?.[m]) || 0;
-    const tVal = Number(tokenBreakdown?.[m]) || 0;
-    const pVal = isCost ? cVal : tVal;
-    if (pVal > 0 || cVal > 0 || tVal > 0) {
-      entries.push({ model: m, primary: pVal > 0 ? pVal : cVal, cost: cVal, tokens: tVal });
-    }
+  for (const model of names) {
+    const cost = Number(costBreakdown[model]) || 0;
+    const tokens = Number(tokenBreakdown[model]) || 0;
+    if (cost > 0 || tokens > 0) entries.push({ model, cost, tokens, primary: isCost ? cost : tokens });
   }
 
   const sig = activityMetric + '|' + entries.map((e) => `${e.model}:${e.cost.toFixed(4)}:${e.tokens}`).sort().join('|');
   if (sig === lastModelSig) return;
   lastModelSig = sig;
 
-  if (!entries.length) {
-    els.modelBarWrap.classList.add('empty');
-    els.modelBar.innerHTML = '';
-    els.modelLegend.innerHTML = '';
-    return;
-  }
-  els.modelBarWrap.classList.remove('empty');
+  els.modelBarWrap.classList.toggle('empty', !entries.length);
   entries.sort((a, b) => b.primary - a.primary);
   const total = entries.reduce((s, e) => s + e.primary, 0) || 1;
-  els.modelBar.innerHTML = buildModelSegments(entries, total);
-  els.modelLegend.innerHTML = buildModelLegend(entries, isCost);
-}
 
-function buildModelSegments(entries, total) {
-  return entries.map((e) => {
-    const w = (e.primary / total) * 100;
-    const c = modelColor(e.model);
-    return '<div class="seg" style="width:' + w.toFixed(2) + '%;background:' + c + '"></div>';
+  const shown = collapseSmallModels(entries, total);
+
+  els.modelBar.innerHTML = shown.map((e) =>
+    `<div class="seg" style="width:${((e.primary / total) * 100).toFixed(2)}%;background:${modelColor(e.model)}"></div>`).join('');
+
+  els.modelLegend.innerHTML = shown.map((e) => {
+    const value = isCost ? fmtUsd(e.cost) : `~${fmtTok(e.tokens)}`;
+    const title = `${(e.members || [e.model]).join(', ')}: ${fmtUsd(e.cost)} · ~${fmtTok(e.tokens)} tokens`;
+    return `<span class="leg" title="${escapeHtml(title)}">`
+      + `<span class="swatch" style="background:${modelColor(e.model)}"></span>`
+      + `<span class="leg-name">${escapeHtml(e.model)}</span>`
+      + `<span>${escapeHtml(value)}</span>`
+      + '</span>';
   }).join('');
 }
 
-function buildModelLegend(entries, isCost) {
-  return entries.map((e) => {
-    const c = modelColor(e.model);
-    const valText = isCost
-      ? ('$' + e.cost.toFixed(2))
-      : ('~' + fmtTok(e.tokens) + ' ($' + e.cost.toFixed(2) + ')');
-    const titleText = `${e.model}: $${e.cost.toFixed(2)} \u00b7 ~${fmtTok(e.tokens)} tokens`;
-    return '<span class="leg" title="' + escapeHtml(titleText) + '">' +
-      '<span class="swatch" style="background:' + c + '"></span>' +
-      '<span class="leg-name">' + escapeHtml(e.model) + '</span>' +
-      '<span>' + escapeHtml(valText) + '</span>' +
-      '</span>';
-  }).join('');
-}
-
-function show(state) {
-  els.loading.classList.toggle('hidden', state !== 'loading');
-  els.empty.classList.toggle('hidden', state !== 'empty');
-  els.errorState.classList.toggle('hidden', state !== 'error');
-  els.content.classList.toggle('hidden', state !== 'content');
-}
-
-function capitalize(s) {
-  if (!s) return '';
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
+// Models under 1% of the total are invisible in the bar and crowd the legend.
+// Fold two or more of them into one "Other" entry. Its tooltip names them.
+function collapseSmallModels(entries, total) {
+  const small = entries.filter((e) => e.primary / total < 0.01);
+  if (small.length < 2) return entries;
+  const other = { model: 'Other', members: small.map((e) => e.model), cost: 0, tokens: 0, primary: 0 };
+  for (const e of small) {
+    other.cost += e.cost;
+    other.tokens += e.tokens;
+    other.primary += e.primary;
+  }
+  return [...entries.filter((e) => e.primary / total >= 0.01), other];
 }
 
 // ============ WIRING ============
 
 // Provider switcher tabs (click + ARIA tablist keyboard interactions).
-const TAB_ORDER = ['claude', 'gemini', 'combined'];
 function wireTabs() {
-  const map = {
-    claude: els.tabClaude,
-    gemini: els.tabGemini,
-    combined: els.tabCombined,
-  };
-  for (const key of TAB_ORDER) {
-    const el = map[key];
-    if (!el) continue;
-    el.addEventListener('click', () => setActiveProvider(key));
-    el.addEventListener('keydown', (e) => {
-      const idx = TAB_ORDER.indexOf(activeProvider);
-      if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        setActiveProvider(TAB_ORDER[(idx + 1) % TAB_ORDER.length], { focusTab: true });
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        setActiveProvider(TAB_ORDER[(idx - 1 + TAB_ORDER.length) % TAB_ORDER.length], { focusTab: true });
-      } else if (e.key === 'Home') {
-        e.preventDefault();
-        setActiveProvider(TAB_ORDER[0], { focusTab: true });
-      } else if (e.key === 'End') {
-        e.preventDefault();
-        setActiveProvider(TAB_ORDER[TAB_ORDER.length - 1], { focusTab: true });
-      }
+  const tabs = { claude: els.tabClaude, gemini: els.tabGemini, combined: els.tabCombined };
+  for (const key of PROVIDERS) {
+    tabs[key].addEventListener('click', () => setActiveProvider(key));
+    tabs[key].addEventListener('keydown', (e) => {
+      const idx = PROVIDERS.indexOf(activeProvider);
+      const n = PROVIDERS.length;
+      const target = {
+        ArrowRight: PROVIDERS[(idx + 1) % n],
+        ArrowLeft: PROVIDERS[(idx - 1 + n) % n],
+        Home: PROVIDERS[0],
+        End: PROVIDERS[n - 1],
+      }[e.key];
+      if (!target) return;
+      e.preventDefault();
+      setActiveProvider(target, { focusTab: true });
     });
   }
   updateTabUI(false);
 }
 wireTabs();
 
-// Click (or Enter on keydown / Space on keyup) a limit row to pin it as the
-// headline; again to unpin.
-function wireRow(rowEl, key) {
-  const toggle = () => {
-    const cur = pinnedByProvider[activeProvider];
-    pinnedByProvider[activeProvider] = (cur === key) ? null : key;
-    if (lastSnapshot) render(lastSnapshot);
-  };
-  rowEl.addEventListener('click', toggle);
-  rowEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      toggle();
-    } else if (e.key === ' ') {
-      e.preventDefault();
-    }
-  });
-  rowEl.addEventListener('keyup', (e) => {
-    if (e.key === ' ') {
-      e.preventDefault();
-      toggle();
-    }
-  });
-}
-wireRow(els.rowSession, 'session');
-wireRow(els.rowWeekly,  'weekly');
-wireRow(els.rowFable,   'fable');
-wireRow(els.rowOpus,    'opus');
+// Click a limit row to pin it as the headline. Click again to unpin.
+els.limits.addEventListener('click', (e) => {
+  const key = e.target.closest('.limit-row')?.dataset.key;
+  if (!key) return;
+  const cur = pinnedByProvider[activeProvider];
+  pinnedByProvider[activeProvider] = cur === key ? null : key;
+  rerender();
+});
 
-// Activity period filter cards (Today / 7D / 30D), metric toggle ($ / Tok), and daily comparison bars
-if (els.cellToday) els.cellToday.addEventListener('click', () => setActivityPeriod('today'));
-if (els.cellWeek)  els.cellWeek.addEventListener('click',  () => setActivityPeriod('week'));
-if (els.cellMonth) els.cellMonth.addEventListener('click', () => setActivityPeriod('month'));
+els.cellToday.addEventListener('click', () => setActivityPeriod('today'));
+els.cellWeek.addEventListener('click', () => setActivityPeriod('week'));
+els.cellMonth.addEventListener('click', () => setActivityPeriod('month'));
+els.metricCost.addEventListener('click', () => setActivityMetric('cost'));
+els.metricTokens.addEventListener('click', () => setActivityMetric('tokens'));
 
-if (els.metricCost)   els.metricCost.addEventListener('click',   () => setActivityMetric('cost'));
-if (els.metricTokens) els.metricTokens.addEventListener('click', () => setActivityMetric('tokens'));
+els.dayChip.addEventListener('click', () => {
+  selectedDay = null;
+  rerender();
+});
 
-if (els.dayChip) {
-  els.dayChip.addEventListener('click', () => {
-    selectedDay = null;
-    if (lastSnapshot) render(lastSnapshot);
-  });
+function setHoveredDay(day) {
+  if (day === hoveredDay) return;
+  hoveredDay = day;
+  rerender();
 }
 
-if (els.dailyBars) {
-  els.dailyBars.addEventListener('click', (e) => {
-    const btn = e.target.closest('.day-col');
-    if (!btn) return;
-    const day = btn.getAttribute('data-day');
-    if (!day) return;
-    selectedDay = (selectedDay === day) ? null : day;
-    if (lastSnapshot) render(lastSnapshot);
-  });
-  els.dailyBars.addEventListener('mouseover', (e) => {
-    const btn = e.target.closest('.day-col');
-    const day = btn ? btn.getAttribute('data-day') : null;
-    if (day && day !== hoveredDay) {
-      hoveredDay = day;
-      if (lastSnapshot) render(lastSnapshot);
-    }
-  });
-  els.dailyBars.addEventListener('mouseleave', () => {
-    if (hoveredDay !== null) {
-      hoveredDay = null;
-      if (lastSnapshot) render(lastSnapshot);
-    }
-  });
-  els.dailyBars.addEventListener('focusin', (e) => {
-    const btn = e.target.closest('.day-col');
-    const day = btn ? btn.getAttribute('data-day') : null;
-    if (day && day !== hoveredDay) {
-      hoveredDay = day;
-      if (lastSnapshot) render(lastSnapshot);
-    }
-  });
-  els.dailyBars.addEventListener('focusout', () => {
-    if (hoveredDay !== null) {
-      hoveredDay = null;
-      if (lastSnapshot) render(lastSnapshot);
-    }
-  });
-}
+els.dailyBars.addEventListener('click', (e) => {
+  const day = e.target.closest('.day-col')?.dataset.day;
+  if (!day) return;
+  selectedDay = selectedDay === day ? null : day;
+  rerender();
+});
+const hoverTarget = (e) => {
+  const day = e.target.closest('.day-col')?.dataset.day;
+  if (day) setHoveredDay(day);
+};
+els.dailyBars.addEventListener('mouseover', hoverTarget);
+els.dailyBars.addEventListener('focusin', hoverTarget);
+els.dailyBars.addEventListener('mouseleave', () => setHoveredDay(null));
+els.dailyBars.addEventListener('focusout', () => setHoveredDay(null));
 
 els.refresh.addEventListener('click', () => window.claudeBar.refresh());
 els.quit.addEventListener('click', () => window.claudeBar.quit());
@@ -1109,7 +817,7 @@ window.claudeBar.getState().then(render);
 // Report content height to main so the popup grows/shrinks with the layout
 // instead of clipping. Throttled with rAF + a small minimum-change guard.
 (function wireAutoSize() {
-  const root = document.getElementById('app') || document.body;
+  const root = $('app');
   let lastH = 0;
   let pending = false;
   const send = () => {
@@ -1117,19 +825,14 @@ window.claudeBar.getState().then(render);
     const h = Math.ceil(root.getBoundingClientRect().height);
     if (h <= 0 || Math.abs(h - lastH) < 2) return;
     lastH = h;
-    if (window.claudeBar && window.claudeBar.setHeight) {
-      window.claudeBar.setHeight(h);
-    }
+    window.claudeBar.setHeight(h);
   };
   const schedule = () => {
     if (pending) return;
     pending = true;
     requestAnimationFrame(send);
   };
-  if (typeof ResizeObserver !== 'undefined') {
-    new ResizeObserver(schedule).observe(root);
-  }
-  window.addEventListener('load', schedule);
+  new ResizeObserver(schedule).observe(root);
   schedule();
 })();
 
@@ -1138,17 +841,10 @@ document.addEventListener('keydown', (e) => {
     window.claudeBar.hide();
     return;
   }
-  // Avoid hijacking when modifier keys are involved.
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === '1') {
-    setActiveProvider('claude');
-  } else if (e.key === '2') {
-    setActiveProvider('gemini');
-  } else if (e.key === '3') {
-    setActiveProvider('combined');
-  } else if (e.key === 'r' || e.key === 'R') {
-    window.claudeBar.refresh();
-  } else if (e.key === 'q' || e.key === 'Q') {
-    window.claudeBar.quit();
-  }
+  // Avoid hijacking when modifier keys are involved. A held key must not repeat.
+  if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+  const tab = { 1: 'claude', 2: 'gemini', 3: 'combined' }[e.key];
+  if (tab) setActiveProvider(tab);
+  else if (e.key === 'r' || e.key === 'R') window.claudeBar.refresh();
+  else if (e.key === 'q' || e.key === 'Q') window.claudeBar.quit();
 });

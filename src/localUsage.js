@@ -1,18 +1,22 @@
-// Local spend accounting, parsed from Claude Code's own JSONL transcripts.
+// Local spend accounting, parsed from the JSONL transcripts that Claude Code,
+// Antigravity, and Gemini CLI write.
 //
-// The corpus is large (hundreds of MB) but strictly APPEND-ONLY: Claude Code
-// only ever adds lines to the end of a session file. Re-reading every file on
-// every tick therefore burns ~96% of its work re-parsing bytes it already
+// The corpus is large (gigabytes) but strictly APPEND-ONLY. Re-reading every
+// file on every tick would burn nearly all of its work on bytes it already
 // parsed. Instead we keep a per-file cursor and read only the new tail.
 //
-// Two consequences drive the design below:
+// Three facts drive the design below:
 //
-//   1. Per-file state must survive across ticks. The byte offset, the
-//      day-bucketed subtotals, and the set of seen message ids (Claude Code
-//      re-emits the same assistant message under multiple parent chains, so
-//      ~44% of usage lines are duplicates and dropping dedupe inflates totals).
-//   2. Day/week/month windows roll over, so we can't keep a single running
-//      total. We bucket each file's spend BY DAY, then re-aggregate the
+//   1. Per-file state must survive across ticks: the byte offset, the
+//      day-bucketed subtotals, and the usage events.
+//   2. Claude Code streams one message as many lines under one message id. The
+//      early lines carry partial output_tokens. The final count only appears
+//      on a later line, so a message's usage can GROW after we first see it.
+//      Keeping the first line alone undercounts output by about 22%. Counting
+//      every line overcounts by double. So we keep one event per message id and
+//      raise it in place when a later line reports more.
+//   3. Today, 7d, and 30d windows roll forward daily, so we can't keep a single
+//      running total. We bucket each file's spend BY DAY, then re-aggregate the
 //      buckets on each tick. Cheap, because there are only ~30 days of them.
 //
 // Reads are chunked rather than readFileSync'd whole: a single 69MB session
@@ -24,46 +28,287 @@ const path = require('path');
 const { cost, displayName } = require('./pricing');
 
 const READ_CHUNK = 1 << 20; // 1 MiB
+const readBuf = Buffer.allocUnsafe(READ_CHUNK); // reads run one at a time
+const SESSION_MS = 5 * 3600 * 1000;
+const WEEK_DAYS = 7;
+const MONTH_DAYS = 30;
 
 // ---------------------------------------------------------------------------
-// Persistent cursor state
+// Persistent state
 // ---------------------------------------------------------------------------
 
-// filePath -> {
-//   offset      bytes consumed so far (always lands on a line boundary)
-//   inode       detects replace-in-place rotation
-//   days        { 'YYYY-MM-DD': { tokens, cost, models: {name: cost} } }
-//   events      [{ ts, input, output, cacheRead, cacheWrite }] for window sums
-//   seen        Set of message.id seen in THIS file
+// cursors: filePath -> {
+//   offset       bytes consumed so far (always lands on a line boundary)
+//   inode        detects replace-in-place rotation
+//   days         { 'YYYY-MM-DD': { tokens, cost, models, modelTokens } }
+//   events       usage events, sorted by ts
+//   activeModel  Antigravity only: the model the conversation last selected
 // }
-const cursors = new Map();
-
-// message.id -> filePath. Dedupe is global (the same message is re-emitted
-// across different session files), so this must live outside the per-file map.
-const seenGlobal = new Map();
-
-// Separate cursor and dedupe maps for Gemini local logs (~/.gemini/antigravity
-// and ~/.gemini/tmp) so Claude and Gemini caches never collide.
-const geminiCursors = new Map();
-const geminiSeenGlobal = new Map();
-const geminiDirCache = new Map();
-
-function resetCache() {
-  cursors.clear();
-  seenGlobal.clear();
-  dirCache.clear();
-  geminiCursors.clear();
-  geminiSeenGlobal.clear();
-  geminiDirCache.clear();
+// seen: message id -> its event. Dedupe is global because a resumed session
+// re-emits the same message in a different file.
+function createTracker() {
+  return { cursors: new Map(), seen: new Map() };
 }
 
+const claude = createTracker();
+const gemini = createTracker();
+
+// dirPath -> { mtimeMs, files: [absolute .jsonl paths], dirs: [absolute paths] }
+// Listing a directory is far more expensive than stat'ing it. A directory's
+// mtime changes when an entry is added or removed, so an unchanged mtime means
+// the cached listing is still valid and readdir can be skipped entirely.
+const dirCache = new Map();
+
+function resetCache() {
+  for (const tracker of [claude, gemini]) {
+    tracker.cursors.clear();
+    tracker.seen.clear();
+  }
+  dirCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Dates. Day keys and period starts are all local time.
+// ---------------------------------------------------------------------------
+
 function dayKey(d) {
-  // Local-time day key, matching the local-time day/week/month boundaries used
-  // by the aggregation below.
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+function dayKeyToMs(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+
+// Rolling windows that include today. "7d" is today and the 6 days before it.
+function periodStarts(now) {
+  const dayStart = (daysAgo) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+  return { today: dayStart(0), week: dayStart(WEEK_DAYS - 1), month: dayStart(MONTH_DAYS - 1) };
+}
+
+// ---------------------------------------------------------------------------
+// Chunked tail reader
+// ---------------------------------------------------------------------------
+
+// Read bytes [from, size) and hand back only COMPLETE lines. A trailing
+// partial line (the writer mid-write) is left unconsumed so the next tick
+// picks it up whole. Returns the new offset, which always sits just past a
+// newline.
+//
+// `needles` are byte strings a useful line must contain. Most of the corpus is
+// tool output with no usage in it. Testing the raw bytes first means those lines
+// are never decoded into strings, which keeps the cold pass's memory peak down.
+function readNewLines(file, from, size, needles, onLine) {
+  if (from >= size) return from;
+
+  const fd = fs.openSync(file, 'r');
+  let pos = from;
+  let carry = null;   // Bytes after the last newline in the previous chunk
+  let consumed = from;
+
+  try {
+    while (pos < size) {
+      const want = Math.min(READ_CHUNK, size - pos);
+      const read = fs.readSync(fd, readBuf, 0, want, pos);
+      if (read <= 0) break;
+      pos += read;
+
+      // Split on raw BYTES, not on a decoded string. A multi-byte UTF-8
+      // character straddling a chunk boundary decodes to replacement chars on
+      // both sides, which makes Buffer.byteLength(line) disagree with the
+      // bytes actually consumed and drifts the offset. The drift then trips
+      // the truncation check and re-reads the whole file every tick.
+      const fresh = readBuf.subarray(0, read);
+      const chunk = carry ? Buffer.concat([carry, fresh]) : fresh;
+      carry = null;
+
+      let start = 0;
+      let nl;
+      while ((nl = chunk.indexOf(0x0a, start)) !== -1) {
+        const line = chunk.subarray(start, nl);
+        if (needles.some((n) => line.includes(n))) onLine(line.toString('utf8'));
+        consumed += nl - start + 1; // +1 for the newline itself
+        start = nl + 1;
+      }
+      // Copy the tail, because the next read overwrites readBuf.
+      if (start < chunk.length) carry = Buffer.from(chunk.subarray(start));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return consumed;
+}
+
+// ---------------------------------------------------------------------------
+// Usage events
+// ---------------------------------------------------------------------------
+
+function eventTokens(e) {
+  return e.input + e.output + e.cacheRead + e.cacheWrite;
+}
+
+// cacheWrite is the total. cacheWrite1h is the part written to the 1-hour cache,
+// which bills at a higher rate than the 5-minute cache.
+function eventCost(e) {
+  return cost({
+    model: e.model,
+    input: e.input,
+    output: e.output,
+    cacheRead: e.cacheRead,
+    cacheWrite: e.cacheWrite - e.cacheWrite1h,
+    cacheWrite1h: e.cacheWrite1h,
+    speed: e.speed,
+    at: e.ts,
+  });
+}
+
+function addToBucket(cur, day, name, tokens, usd) {
+  let bucket = cur.days[day];
+  if (!bucket) bucket = cur.days[day] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
+  bucket.tokens += tokens;
+  bucket.cost += usd;
+  bucket.models[name] = (bucket.models[name] || 0) + usd;
+  bucket.modelTokens[name] = (bucket.modelTokens[name] || 0) + tokens;
+}
+
+function recordUsage(tracker, cur, file, rec, since) {
+  if (!rec.ts) return;
+  const date = new Date(rec.ts);
+  const ts = date.getTime();
+  if (Number.isNaN(ts) || ts < since) return;
+
+  const known = rec.id ? tracker.seen.get(rec.id) : null;
+  if (known) {
+    growEvent(tracker, known, rec);
+    return;
+  }
+
+  const evt = {
+    id: rec.id || null,
+    file,
+    day: dayKey(date),
+    name: displayName(rec.model),
+    model: rec.model,
+    speed: rec.speed,
+    ts,
+    input: rec.input,
+    output: rec.output,
+    cacheRead: rec.cacheRead,
+    cacheWrite: rec.cacheWrite || 0,
+    cacheWrite1h: rec.cacheWrite1h || 0,
+    cost: 0,
+  };
+  const tokens = eventTokens(evt);
+  if (tokens <= 0) return;
+  evt.cost = eventCost(evt);
+
+  if (evt.id) tracker.seen.set(evt.id, evt);
+  addToBucket(cur, evt.day, evt.name, tokens, evt.cost);
+
+  const last = cur.events[cur.events.length - 1];
+  if (last && last.ts > ts) {
+    // Rare out-of-order line: insert in place so lowerBound stays valid.
+    cur.events.splice(lowerBound(cur.events, ts), 0, evt);
+  } else {
+    cur.events.push(evt);
+  }
+}
+
+// A later line for a known message. Raise the event to the highest count seen
+// and pass the difference on to the day bucket of the file that owns the event.
+function growEvent(tracker, evt, rec) {
+  const cacheWrite = rec.cacheWrite || 0;
+  const cacheWrite1h = rec.cacheWrite1h || 0;
+  if (rec.input <= evt.input && rec.output <= evt.output && rec.cacheRead <= evt.cacheRead
+    && cacheWrite <= evt.cacheWrite && cacheWrite1h <= evt.cacheWrite1h) return;
+
+  const oldTokens = eventTokens(evt);
+  const oldCost = evt.cost;
+  evt.input = Math.max(evt.input, rec.input);
+  evt.output = Math.max(evt.output, rec.output);
+  evt.cacheRead = Math.max(evt.cacheRead, rec.cacheRead);
+  evt.cacheWrite = Math.max(evt.cacheWrite, cacheWrite);
+  evt.cacheWrite1h = Math.max(evt.cacheWrite1h, cacheWrite1h);
+  evt.cost = eventCost(evt);
+
+  const owner = tracker.cursors.get(evt.file);
+  if (owner) addToBucket(owner, evt.day, evt.name, eventTokens(evt) - oldTokens, evt.cost - oldCost);
+}
+
+function releaseCursor(tracker, cur) {
+  for (const e of cur.events) {
+    if (e.id) tracker.seen.delete(e.id);
+  }
+}
+
+// Drop day buckets and events that have aged out of the window, so long-running
+// sessions don't grow state without bound.
+function pruneOld(tracker, cur, since) {
+  for (const key of Object.keys(cur.days)) {
+    if (dayKeyToMs(key) < since) delete cur.days[key];
+  }
+  if (cur.events.length && cur.events[0].ts < since) {
+    const keepFrom = lowerBound(cur.events, since);
+    for (let i = 0; i < keepFrom; i++) {
+      if (cur.events[i].id) tracker.seen.delete(cur.events[i].id);
+    }
+    cur.events = cur.events.slice(keepFrom);
+  }
+}
+
+// First index whose ts >= target. Assumes events are sorted ascending.
+function lowerBound(events, target) {
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].ts < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+// ---------------------------------------------------------------------------
+// Sync + aggregate, shared by both providers
+// ---------------------------------------------------------------------------
+
+function syncFiles(tracker, files, since, ingest) {
+  const live = new Set();
+
+  for (const entry of files) {
+    const { file, size, ino } = entry;
+    live.add(file);
+    let cur = tracker.cursors.get(file);
+
+    // A shrunk file or a changed inode means truncation/rotation, not an
+    // append. The cursor is meaningless, so re-read from the top.
+    if (cur && (size < cur.offset || (ino && cur.inode && ino !== cur.inode))) {
+      releaseCursor(tracker, cur);
+      cur = undefined;
+    }
+    if (!cur) {
+      cur = { offset: 0, inode: ino, days: {}, events: [], activeModel: null };
+      tracker.cursors.set(file, cur);
+    }
+
+    if (size > cur.offset) {
+      try { cur.offset = ingest(entry, cur); }
+      catch { /* unreadable this tick; retry next */ }
+    }
+
+    pruneOld(tracker, cur, since);
+  }
+
+  // Forget files that no longer qualify (aged out or deleted), releasing their
+  // dedupe ids.
+  for (const [file, cur] of tracker.cursors) {
+    if (live.has(file)) continue;
+    releaseCursor(tracker, cur);
+    tracker.cursors.delete(file);
+  }
 }
 
 function emptySummary() {
@@ -78,336 +323,115 @@ function emptySummary() {
     weekModelTokens: {},
     monthModelTokens: {},
     daily: {},
-    sessionUsage: zeroBucket(),
-    weeklyUsage: zeroBucket(),
+    sessionUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
 }
 
-function accumulateDayBucket(summary, key, bucket, { todayKey, todayStart, weekStart, monthStartMs }) {
+function addEntries(target, source) {
+  for (const [name, v] of Object.entries(source)) target[name] = (target[name] || 0) + v;
+}
+
+function accumulateDayBucket(summary, key, bucket, periods) {
   const dayMs = dayKeyToMs(key);
-  if (dayMs < monthStartMs) return;
+  if (dayMs < periods.month) return;
 
   summary.monthTokens += bucket.tokens;
   summary.monthCost += bucket.cost;
+  addEntries(summary.modelBreakdown, bucket.models);
+  addEntries(summary.monthModelTokens, bucket.modelTokens);
 
   let dayEntry = summary.daily[key];
-  if (!dayEntry) {
-    dayEntry = summary.daily[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
-  }
+  if (!dayEntry) dayEntry = summary.daily[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
   dayEntry.tokens += bucket.tokens;
   dayEntry.cost += bucket.cost;
+  addEntries(dayEntry.models, bucket.models);
+  addEntries(dayEntry.modelTokens, bucket.modelTokens);
 
-  for (const [name, c] of Object.entries(bucket.models)) {
-    summary.modelBreakdown[name] = (summary.modelBreakdown[name] || 0) + c;
-    dayEntry.models[name] = (dayEntry.models[name] || 0) + c;
-  }
-  if (bucket.modelTokens) {
-    for (const [name, t] of Object.entries(bucket.modelTokens)) {
-      summary.monthModelTokens[name] = (summary.monthModelTokens[name] || 0) + t;
-      dayEntry.modelTokens[name] = (dayEntry.modelTokens[name] || 0) + t;
-    }
-  }
-
-  if (dayMs >= weekStart) {
+  if (dayMs >= periods.week) {
     summary.weekTokens += bucket.tokens;
     summary.weekCost += bucket.cost;
-    for (const [name, c] of Object.entries(bucket.models)) {
-      summary.weekModelBreakdown[name] = (summary.weekModelBreakdown[name] || 0) + c;
-    }
-    if (bucket.modelTokens) {
-      for (const [name, t] of Object.entries(bucket.modelTokens)) {
-        summary.weekModelTokens[name] = (summary.weekModelTokens[name] || 0) + t;
-      }
-    }
+    addEntries(summary.weekModelBreakdown, bucket.models);
+    addEntries(summary.weekModelTokens, bucket.modelTokens);
   }
 
-  if (key === todayKey || dayMs >= todayStart) {
+  if (dayMs >= periods.today) {
     summary.todayTokens += bucket.tokens;
     summary.todayCost += bucket.cost;
-    for (const [name, c] of Object.entries(bucket.models)) {
-      summary.todayModelBreakdown[name] = (summary.todayModelBreakdown[name] || 0) + c;
-    }
-    if (bucket.modelTokens) {
-      for (const [name, t] of Object.entries(bucket.modelTokens)) {
-        summary.todayModelTokens[name] = (summary.todayModelTokens[name] || 0) + t;
-      }
-    }
+    addEntries(summary.todayModelBreakdown, bucket.models);
+    addEntries(summary.todayModelTokens, bucket.modelTokens);
   }
 }
 
-function zeroBucket() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-}
-
-function bucketTotal(b) {
-  return b.input + b.output + b.cacheRead + b.cacheWrite;
-}
-
-function startOfDay(d) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-
-function startOfWeek(d) {
-  // ISO week starting Monday
-  const x = startOfDay(d);
-  const day = (x.getDay() + 6) % 7; // 0 = Monday
-  x.setDate(x.getDate() - day);
-  return x;
-}
-
-function startOfMonth(d) {
-  return new Date(d.getFullYear(), d.getMonth(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Chunked tail reader
-// ---------------------------------------------------------------------------
-
-// Read bytes [from, size) and hand back only COMPLETE lines. A trailing
-// partial line (Claude Code mid-write) is left unconsumed so the next tick
-// picks it up whole. Returns the new offset, which always sits just past a
-// newline.
-function readNewLines(file, from, size, onLine) {
-  if (from >= size) return from;
-
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.allocUnsafe(READ_CHUNK);
-  let pos = from;
-  let carry = null;   // Buffer of bytes after the last newline in the chunk
-  let consumed = from;
-
-  try {
-    while (pos < size) {
-      const want = Math.min(READ_CHUNK, size - pos);
-      const read = fs.readSync(fd, buf, 0, want, pos);
-      if (read <= 0) break;
-      pos += read;
-
-      // Split on raw BYTES, not on a decoded string. A multi-byte UTF-8
-      // character straddling a chunk boundary decodes to replacement chars on
-      // both sides, which makes Buffer.byteLength(line) disagree with the
-      // bytes actually consumed and drifts the offset. The drift then trips
-      // the truncation check and re-reads the whole file every tick.
-      let chunk = carry
-        ? Buffer.concat([carry, buf.subarray(0, read)])
-        : Buffer.from(buf.subarray(0, read));
-      carry = null;
-
-      let start = 0;
-      let nl;
-      while ((nl = chunk.indexOf(0x0a, start)) !== -1) {
-        onLine(chunk.toString('utf8', start, nl));
-        consumed += nl - start + 1; // +1 for the newline itself
-        start = nl + 1;
-      }
-      if (start < chunk.length) carry = chunk.subarray(start);
+function summarize(tracker, periods, sessionWindowStart) {
+  const summary = emptySummary();
+  const su = summary.sessionUsage;
+  for (const cur of tracker.cursors.values()) {
+    for (const [key, bucket] of Object.entries(cur.days)) {
+      accumulateDayBucket(summary, key, bucket, periods);
     }
-  } finally {
-    fs.closeSync(fd);
+    if (sessionWindowStart == null) continue;
+    // Events are sorted, so the window is a suffix of the array. Binary-search
+    // the first in-window index rather than scanning every event on every tick.
+    for (let i = lowerBound(cur.events, sessionWindowStart); i < cur.events.length; i++) {
+      const e = cur.events[i];
+      su.input += e.input;
+      su.output += e.output;
+      su.cacheRead += e.cacheRead;
+      su.cacheWrite += e.cacheWrite;
+    }
   }
-
-  return consumed;
+  return summary;
 }
 
 // ---------------------------------------------------------------------------
-// Line -> accounting
+// Claude Code
 // ---------------------------------------------------------------------------
 
-function ingestLine(line, cur, file, monthStartMs) {
-  // Cheap reject before the expensive JSON.parse. Most lines are user turns,
-  // tool results, or metadata with no usage block at all.
-  if (!line || line.indexOf('"input_tokens"') === -1) return;
+const CLAUDE_NEEDLES = [Buffer.from('"input_tokens"')];
 
+function ingestClaudeLine(cur, file, line, since) {
   let obj;
   try { obj = JSON.parse(line); }
   catch { return; }
 
   if (obj.type !== 'assistant') return;
   const message = obj.message;
-  if (!message) return;
-  const usage = message.usage;
+  const usage = message && message.usage;
   if (!usage) return;
 
-  const id = message.id;
-  if (id) {
-    const owner = seenGlobal.get(id);
-    if (owner !== undefined && owner !== file) return; // counted by another file
-    if (cur.seen.has(id)) return;                      // counted by this file
-    cur.seen.add(id);
-    seenGlobal.set(id, file);
-  }
-
-  const tsRaw = obj.timestamp;
-  if (!tsRaw) return;
-  const ts = new Date(tsRaw);
-  const tsMs = ts.getTime();
-  if (Number.isNaN(tsMs) || tsMs < monthStartMs) return;
-
-  const input = usage.input_tokens || 0;
-  const output = usage.output_tokens || 0;
-  const cacheRead = usage.cache_read_input_tokens || 0;
-  const cacheWrite = usage.cache_creation_input_tokens || 0;
-  // Newer Claude Code builds split cache writes by TTL. The 1-hour cache
-  // costs 2x input and the 5-minute cache 1.25x, so price them apart when
-  // the breakdown is present. Older lines carry only the total. Treat that
-  // as 5-minute writes.
-  const cc = usage.cache_creation;
-  const cacheWrite1h = Math.min(cacheWrite, (cc && cc.ephemeral_1h_input_tokens) || 0);
-  const cacheWrite5m = cacheWrite - cacheWrite1h;
-  const model = message.model || 'unknown';
-  // Synthetic responses are locally generated and never billed; keeping them
+  // Synthetic responses are locally generated and never billed. Keeping them
   // only adds a permanent $0 row to the model legend.
+  const model = message.model || 'unknown';
   if (model === '<synthetic>') return;
 
-  const lineCost = cost({
-    model, input, output, cacheRead,
-    cacheWrite: cacheWrite5m, cacheWrite1h, speed: usage.speed,
-  });
-  const tokens = input + output + cacheRead + cacheWrite;
-  const dn = displayName(model);
+  // Newer Claude Code builds split cache writes by TTL. Older lines carry only
+  // the total, which we treat as 5-minute writes.
+  const cacheWrite = usage.cache_creation_input_tokens || 0;
+  const cc = usage.cache_creation;
 
-  const key = dayKey(ts);
-  let bucket = cur.days[key];
-  if (!bucket) bucket = cur.days[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
-  bucket.tokens += tokens;
-  bucket.cost += lineCost;
-  bucket.models[dn] = (bucket.models[dn] || 0) + lineCost;
-  bucket.modelTokens[dn] = (bucket.modelTokens[dn] || 0) + tokens;
-
-  // Session/weekly windows are anchored to API-supplied reset times that move
-  // independently of calendar days, so keep the raw events to sum over.
-  const evt = { ts: tsMs, input, output, cacheRead, cacheWrite };
-  const last = cur.events[cur.events.length - 1];
-  if (last && last.ts > tsMs) {
-    // Rare out-of-order line: insert in place so lowerBound stays valid.
-    cur.events.splice(lowerBound(cur.events, tsMs), 0, evt);
-  } else {
-    cur.events.push(evt);
-  }
+  recordUsage(claude, cur, file, {
+    id: message.id,
+    ts: obj.timestamp,
+    model,
+    speed: usage.speed,
+    input: usage.input_tokens || 0,
+    output: usage.output_tokens || 0,
+    cacheRead: usage.cache_read_input_tokens || 0,
+    cacheWrite,
+    cacheWrite1h: Math.min(cacheWrite, (cc && cc.ephemeral_1h_input_tokens) || 0),
+  }, since);
 }
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
-
-async function parseLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = {}) {
+async function parseLocalLogs({ sessionResetAt = null } = {}) {
   const projectsDir = path.join(os.homedir(), '.claude', 'projects');
-  const summary = emptySummary();
-  if (!safeIsDir(projectsDir)) return summary;
+  if (!safeIsDir(projectsDir)) return emptySummary();
 
-  const now = new Date();
-  const todayStart = startOfDay(now).getTime();
-  const weekStart = startOfWeek(now).getTime();
-  const monthStart = startOfMonth(now);
-  const monthStartMs = monthStart.getTime();
+  const periods = periodStarts(new Date());
+  syncFiles(claude, collectJsonl(projectsDir, periods.month), periods.month, ({ file, size }, cur) =>
+    readNewLines(file, cur.offset, size, CLAUDE_NEEDLES, (line) => ingestClaudeLine(cur, file, line, periods.month)));
 
-  const sessionWindowStart = sessionResetAt
-    ? sessionResetAt.getTime() - 5 * 3600 * 1000
-    : null;
-  const weeklyWindowStart = weeklyResetAt
-    ? weeklyResetAt.getTime() - 7 * 24 * 3600 * 1000
-    : null;
-
-  const files = collectJsonl(projectsDir, monthStart);
-  const live = new Set();
-
-  for (const { file, size, ino } of files) {
-    live.add(file);
-    let cur = cursors.get(file);
-
-    // A shrunk file or a changed inode means truncation/rotation, not an
-    // append. The cursor is meaningless, so re-read from the top.
-    if (cur && (size < cur.offset || (ino && cur.inode && ino !== cur.inode))) {
-      for (const id of cur.seen) seenGlobal.delete(id);
-      cur = undefined;
-    }
-    if (!cur) {
-      cur = { offset: 0, inode: ino, days: {}, events: [], seen: new Set() };
-      cursors.set(file, cur);
-    }
-
-    if (size > cur.offset) {
-      try {
-        cur.offset = readNewLines(file, cur.offset, size, (line) => {
-          ingestLine(line, cur, file, monthStartMs);
-        });
-      } catch { /* unreadable this tick; retry next */ }
-    }
-
-    // Drop day buckets and events that have aged out of the month window, so
-    // long-running sessions don't grow state without bound.
-    pruneOld(cur, monthStartMs);
-  }
-
-  // Forget files that no longer qualify (aged out of the month window or were
-  // deleted), releasing their dedupe ids.
-  for (const [file, cur] of cursors) {
-    if (live.has(file)) continue;
-    for (const id of cur.seen) seenGlobal.delete(id);
-    cursors.delete(file);
-  }
-
-  // ---- Re-aggregate from the cached per-file buckets ----
-  const todayKey = dayKey(now);
-  const bounds = { todayKey, todayStart, weekStart, monthStartMs };
-  for (const cur of cursors.values()) {
-    for (const [key, bucket] of Object.entries(cur.days)) {
-      accumulateDayBucket(summary, key, bucket, bounds);
-    }
-
-    if (sessionWindowStart == null && weeklyWindowStart == null) continue;
-    // Events are appended in timestamp order, so the array is sorted and the
-    // window is a suffix of it. Binary-search the first in-window index rather
-    // than scanning every event on every tick.
-    if (sessionWindowStart != null) {
-      for (let i = lowerBound(cur.events, sessionWindowStart); i < cur.events.length; i++) {
-        const e = cur.events[i];
-        addBucket(summary.sessionUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
-      }
-    }
-    if (weeklyWindowStart != null) {
-      for (let i = lowerBound(cur.events, weeklyWindowStart); i < cur.events.length; i++) {
-        const e = cur.events[i];
-        addBucket(summary.weeklyUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
-      }
-    }
-  }
-
-  return summary;
-}
-
-// First index whose ts >= target. Assumes events are sorted ascending.
-function lowerBound(events, target) {
-  let lo = 0, hi = events.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (events[mid].ts < target) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-function dayKeyToMs(key) {
-  const [y, m, d] = key.split('-').map(Number);
-  return new Date(y, m - 1, d).getTime();
-}
-
-function pruneOld(cur, monthStartMs) {
-  for (const key of Object.keys(cur.days)) {
-    if (dayKeyToMs(key) < monthStartMs) delete cur.days[key];
-  }
-  if (cur.events.length && cur.events[0].ts < monthStartMs) {
-    cur.events = cur.events.filter((e) => e.ts >= monthStartMs);
-  }
-}
-
-function addBucket(b, input, output, cacheRead, cacheWrite) {
-  b.input += input;
-  b.output += output;
-  b.cacheRead += cacheRead;
-  b.cacheWrite += cacheWrite;
+  const sessionStart = sessionResetAt ? sessionResetAt.getTime() - SESSION_MS : null;
+  return summarize(claude, periods, sessionStart);
 }
 
 function safeIsDir(p) {
@@ -415,11 +439,15 @@ function safeIsDir(p) {
   catch { return false; }
 }
 
-// dirPath -> { mtimeMs, files: [absolute .jsonl paths] }
-// Listing a directory is far more expensive than stat'ing it. A directory's
-// mtime changes when an entry is added or removed, so an unchanged mtime means
-// the cached listing is still valid and readdir can be skipped entirely.
-const dirCache = new Map();
+function listDirs(p) {
+  try {
+    return fs.readdirSync(p, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
 
 function listJsonlFiles(root) {
   const out = [];
@@ -464,229 +492,121 @@ function listJsonlFiles(root) {
   return out;
 }
 
-function collectJsonl(root, sinceDate) {
-  const out = [];
-  const sinceMs = sinceDate.getTime();
-  for (const full of listJsonlFiles(root)) {
-    // A file already being tracked can skip the mtime gate: its cursor proves
-    // it qualified, and re-checking only risks dropping it mid-month.
-    const known = cursors.get(full);
-    try {
-      const st = fs.statSync(full);
-      if (known || st.mtimeMs >= sinceMs) {
-        out.push({ file: full, size: st.size, ino: st.ino });
-      }
-    } catch {}
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Gemini Local Log Accounting (Antigravity brain transcripts + Gemini CLI chats)
-// ---------------------------------------------------------------------------
-
-function readDefaultAntigravityModel() {
+function statIfRecent(file, sinceMs) {
   try {
-    const pbtxt = path.join(os.homedir(), '.gemini', 'antigravity', 'antigravity_state.pbtxt');
-    if (fs.existsSync(pbtxt)) {
-      const raw = fs.readFileSync(pbtxt, 'utf8');
-      const m = raw.match(/last_selected_agent_model:\s*([^\s\n]+)/);
-      if (m && m[1]) {
-        if (m[1] === 'MODEL_PLACEHOLDER_M417') return 'gemini-4-argon';
-        return m[1].toLowerCase();
-      }
-    }
-  } catch {}
-  return 'gemini-4-argon';
-}
-
-function recordGeminiUsageEvent(cur, file, { id, tsRaw, model, input, output, cacheRead, cacheWrite = 0 }, monthStartMs) {
-  if (id) {
-    const owner = geminiSeenGlobal.get(id);
-    if (owner !== undefined && owner !== file) return;
-    if (cur.seen.has(id)) return;
-    cur.seen.add(id);
-    geminiSeenGlobal.set(id, file);
-  }
-
-  if (!tsRaw) return;
-  const ts = new Date(tsRaw);
-  const tsMs = ts.getTime();
-  if (Number.isNaN(tsMs) || tsMs < monthStartMs) return;
-
-  const lineCost = cost({ model, input, output, cacheRead, cacheWrite });
-  const tokens = input + output + cacheRead + cacheWrite;
-  if (tokens <= 0) return;
-  const dn = displayName(model);
-
-  const key = dayKey(ts);
-  let bucket = cur.days[key];
-  if (!bucket) bucket = cur.days[key] = { tokens: 0, cost: 0, models: {}, modelTokens: {} };
-  bucket.tokens += tokens;
-  bucket.cost += lineCost;
-  bucket.models[dn] = (bucket.models[dn] || 0) + lineCost;
-  bucket.modelTokens[dn] = (bucket.modelTokens[dn] || 0) + tokens;
-
-  const evt = { ts: tsMs, input, output, cacheRead, cacheWrite };
-  const last = cur.events[cur.events.length - 1];
-  if (last && last.ts > tsMs) {
-    cur.events.splice(lowerBound(cur.events, tsMs), 0, evt);
-  } else {
-    cur.events.push(evt);
+    const st = fs.statSync(file);
+    return st.isFile() && st.mtimeMs >= sinceMs ? st : null;
+  } catch {
+    return null;
   }
 }
 
-function ingestGeminiLine(line, cur, file, monthStartMs, defaultModel) {
-  if (!line) return;
-
-  // 1. Track Antigravity model selection changes inside USER_INPUT steps
-  if (line.indexOf('Model Selection') !== -1 && line.indexOf('"USER_INPUT"') !== -1) {
-    try {
-      const obj = JSON.parse(line);
-      if (obj.type === 'USER_INPUT' && typeof obj.content === 'string') {
-        const m = obj.content.match(/changed setting `Model Selection` from [^\n]+? to ([^.\n]+)/);
-        if (m && m[1]) cur.activeModel = m[1].trim();
-      }
-    } catch {}
-    return;
-  }
-
-  // 2. Antigravity PLANNER_RESPONSE steps carry input_tokens, cache_read_tokens, output_tokens
-  if (line.indexOf('"PLANNER_RESPONSE"') !== -1 && line.indexOf('"input_tokens"') !== -1) {
-    let obj;
-    try { obj = JSON.parse(line); }
-    catch { return; }
-    if (obj.type !== 'PLANNER_RESPONSE') return;
-
-    const input = Number(obj.input_tokens) || 0;
-    const cacheRead = Number(obj.cache_read_tokens) || 0;
-    const output = Number(obj.output_tokens) || 0;
-    const model = obj.model || cur.activeModel || defaultModel;
-    const id = `agy:${file}:${obj.step_index ?? obj.created_at}`;
-
-    recordGeminiUsageEvent(cur, file, {
-      id,
-      tsRaw: obj.created_at || obj.timestamp,
-      model,
-      input,
-      output,
-      cacheRead,
-    }, monthStartMs);
-    return;
-  }
-
-  // 3. Gemini CLI .jsonl chat lines carry { type: "gemini", model, tokens: { input, output, cached, thoughts } }
-  if (line.indexOf('"gemini"') !== -1 && line.indexOf('"tokens"') !== -1) {
-    let obj;
-    try { obj = JSON.parse(line); }
-    catch { return; }
-    if (obj.type !== 'gemini' || !obj.tokens || typeof obj.tokens !== 'object') return;
-
-    const cacheRead = Number(obj.tokens.cached) || 0;
-    const rawInput = Number(obj.tokens.input) || 0;
-    const input = Math.max(0, rawInput - cacheRead);
-    const output = (Number(obj.tokens.output) || 0) + (Number(obj.tokens.thoughts) || 0);
-    const model = obj.model || 'gemini-2.5-pro';
-    const id = obj.id ? `gcli:${obj.id}` : `gcli:${file}:${obj.timestamp}`;
-
-    recordGeminiUsageEvent(cur, file, {
-      id,
-      tsRaw: obj.timestamp || obj.created_at,
-      model,
-      input,
-      output,
-      cacheRead,
-    }, monthStartMs);
-  }
-}
-
-function ingestGeminiJsonFile(file, cur, monthStartMs) {
-  let raw;
-  try { raw = fs.readFileSync(file, 'utf8'); }
-  catch { return; }
-  let data;
-  try { data = JSON.parse(raw); }
-  catch { return; }
-  const messages = Array.isArray(data?.messages) ? data.messages : [];
-  for (const msg of messages) {
-    if (!msg || msg.type !== 'gemini' || !msg.tokens || typeof msg.tokens !== 'object') continue;
-    const cacheRead = Number(msg.tokens.cached) || 0;
-    const rawInput = Number(msg.tokens.input) || 0;
-    const input = Math.max(0, rawInput - cacheRead);
-    const output = (Number(msg.tokens.output) || 0) + (Number(msg.tokens.thoughts) || 0);
-    const model = msg.model || 'gemini-2.5-pro';
-    const id = msg.id ? `gcli:${msg.id}` : `gcli:${file}:${msg.timestamp}`;
-    recordGeminiUsageEvent(cur, file, {
-      id,
-      tsRaw: msg.timestamp || data.lastUpdated || data.startTime,
-      model,
-      input,
-      output,
-      cacheRead,
-    }, monthStartMs);
-  }
-}
-
-function collectGeminiLogFiles(sinceDate) {
+function collectJsonl(root, sinceMs) {
   const out = [];
-  const sinceMs = sinceDate.getTime();
-  const home = os.homedir();
+  for (const file of listJsonlFiles(root)) {
+    const st = statIfRecent(file, sinceMs);
+    if (st) out.push({ file, size: st.size, ino: st.ino });
+  }
+  return out;
+}
 
-  // 1. Antigravity brain transcripts: ~/.gemini/antigravity/brain/<convId>/.system_generated/logs/transcript.jsonl
-  const brainDir = path.join(home, '.gemini', 'antigravity', 'brain');
-  if (safeIsDir(brainDir)) {
-    let convDirs = [];
-    try { convDirs = fs.readdirSync(brainDir, { withFileTypes: true }); }
-    catch {}
-    for (const d of convDirs) {
-      if (!d.isDirectory() || d.name.startsWith('.')) continue;
-      const transcript = path.join(brainDir, d.name, '.system_generated', 'logs', 'transcript.jsonl');
-      const known = geminiCursors.get(transcript);
-      try {
-        const st = fs.statSync(transcript);
-        if (st.isFile() && (known || st.mtimeMs >= sinceMs)) {
-          out.push({ file: transcript, size: st.size, ino: st.ino, format: 'jsonl' });
-        }
-      } catch {}
+// ---------------------------------------------------------------------------
+// Gemini: Antigravity brain transcripts + Gemini CLI chats
+// ---------------------------------------------------------------------------
+
+// The desktop app and the CLI each keep their own brain directory, with the
+// same transcript format. Each conversation also holds transcript_full.jsonl
+// and chunks/, which repeat the same steps, so only transcript.jsonl is read.
+const ANTIGRAVITY_ROOTS = ['antigravity', 'antigravity-cli'];
+const DEFAULT_GEMINI_MODEL = 'gemini-4-argon';
+const GEMINI_NEEDLES = ['Model Selection', '"input_tokens"', '"tokens"'].map((n) => Buffer.from(n));
+
+// Runs to the period that ends the sentence, so a version like "3.8" survives:
+// "...to Gemini 3.8 Flash (Low). No need to comment..." gives "Gemini 3.8 Flash (Low)".
+const MODEL_SELECTION = /changed setting `Model Selection` from .+? to (.+?)(?:\.(?:\s|$)|\n|$)/;
+
+function defaultAntigravityModel(rootDir) {
+  try {
+    const raw = fs.readFileSync(path.join(rootDir, 'antigravity_state.pbtxt'), 'utf8');
+    const m = raw.match(/last_selected_agent_model:\s*(\S+)/);
+    if (m && !/^MODEL_PLACEHOLDER/i.test(m[1])) return m[1].toLowerCase();
+  } catch {}
+  return DEFAULT_GEMINI_MODEL;
+}
+
+function recordGeminiCliMessage(cur, file, msg, fallbackTs, since) {
+  if (msg.type !== 'gemini' || !msg.tokens || typeof msg.tokens !== 'object') return;
+  const cacheRead = Number(msg.tokens.cached) || 0;
+  recordUsage(gemini, cur, file, {
+    id: msg.id ? `gcli:${msg.id}` : `gcli:${file}:${msg.timestamp}`,
+    ts: msg.timestamp || fallbackTs,
+    model: msg.model || 'gemini-2.5-pro',
+    input: Math.max(0, (Number(msg.tokens.input) || 0) - cacheRead),
+    output: (Number(msg.tokens.output) || 0) + (Number(msg.tokens.thoughts) || 0),
+    cacheRead,
+  }, since);
+}
+
+function ingestGeminiLine(cur, file, line, since, defaultModel) {
+  let obj;
+  try { obj = JSON.parse(line); }
+  catch { return; }
+
+  if (obj.type === 'USER_INPUT') {
+    const m = typeof obj.content === 'string' && obj.content.match(MODEL_SELECTION);
+    if (m) cur.activeModel = m[1].trim();
+  } else if (obj.type === 'PLANNER_RESPONSE') {
+    recordUsage(gemini, cur, file, {
+      id: `agy:${file}:${obj.step_index ?? obj.created_at}`,
+      ts: obj.created_at || obj.timestamp,
+      model: obj.model || cur.activeModel || defaultModel,
+      input: Number(obj.input_tokens) || 0,
+      output: Number(obj.output_tokens) || 0,
+      cacheRead: Number(obj.cache_read_tokens) || 0,
+    }, since);
+  } else {
+    recordGeminiCliMessage(cur, file, obj, obj.created_at, since);
+  }
+}
+
+function ingestGeminiJsonFile(cur, file, since) {
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  for (const msg of Array.isArray(data?.messages) ? data.messages : []) {
+    if (msg) recordGeminiCliMessage(cur, file, msg, data.lastUpdated || data.startTime, since);
+  }
+}
+
+function collectGeminiLogFiles(sinceMs) {
+  const out = [];
+  const base = path.join(os.homedir(), '.gemini');
+  const add = (file, format, defaultModel) => {
+    const st = statIfRecent(file, sinceMs);
+    if (st) out.push({ file, size: st.size, ino: st.ino, format, defaultModel });
+  };
+
+  for (const name of ANTIGRAVITY_ROOTS) {
+    const root = path.join(base, name);
+    const brain = path.join(root, 'brain');
+    const defaultModel = defaultAntigravityModel(root);
+    for (const conv of listDirs(brain)) {
+      add(path.join(brain, conv, '.system_generated', 'logs', 'transcript.jsonl'), 'jsonl', defaultModel);
     }
   }
 
-  // 2. Gemini CLI session logs: ~/.gemini/tmp/<project>/chats/*.jsonl and *.json
-  const tmpDir = path.join(home, '.gemini', 'tmp');
-  if (safeIsDir(tmpDir)) {
-    let projDirs = [];
-    try { projDirs = fs.readdirSync(tmpDir, { withFileTypes: true }); }
-    catch {}
-    for (const p of projDirs) {
-      if (!p.isDirectory() || p.name.startsWith('.')) continue;
-      const chatsDir = path.join(tmpDir, p.name, 'chats');
-      if (!safeIsDir(chatsDir)) continue;
-      const stack = [chatsDir];
-      while (stack.length) {
-        const curDir = stack.pop();
-        let entries = [];
-        try { entries = fs.readdirSync(curDir, { withFileTypes: true }); }
-        catch { continue; }
-        for (const e of entries) {
-          if (e.name.startsWith('.')) continue;
-          const full = path.join(curDir, e.name);
-          if (e.isDirectory()) {
-            stack.push(full);
-          } else if (e.isFile() && (e.name.endsWith('.jsonl') || e.name.endsWith('.json'))) {
-            const known = geminiCursors.get(full);
-            try {
-              const st = fs.statSync(full);
-              if (known || st.mtimeMs >= sinceMs) {
-                out.push({
-                  file: full,
-                  size: st.size,
-                  ino: st.ino,
-                  format: e.name.endsWith('.json') ? 'json' : 'jsonl',
-                });
-              }
-            } catch {}
-          }
-        }
+  const tmp = path.join(base, 'tmp');
+  for (const project of listDirs(tmp)) {
+    const stack = [path.join(tmp, project, 'chats')];
+    while (stack.length) {
+      const dir = stack.pop();
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+      catch { continue; }
+      for (const e of entries) {
+        if (e.name.startsWith('.')) continue;
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) stack.push(full);
+        else if (e.name.endsWith('.jsonl')) add(full, 'jsonl', DEFAULT_GEMINI_MODEL);
+        else if (e.name.endsWith('.json')) add(full, 'json', DEFAULT_GEMINI_MODEL);
       }
     }
   }
@@ -694,82 +614,28 @@ function collectGeminiLogFiles(sinceDate) {
   return out;
 }
 
-async function parseGeminiLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = {}) {
-  const summary = emptySummary();
+async function parseGeminiLocalLogs({ sessionResetAt = null } = {}) {
   const now = new Date();
-  const todayStart = startOfDay(now).getTime();
-  const weekStart = startOfWeek(now).getTime();
-  const monthStart = startOfMonth(now);
-  const monthStartMs = monthStart.getTime();
+  const periods = periodStarts(now);
 
-  const sessionWindowStart = sessionResetAt
-    ? sessionResetAt.getTime() - 5 * 3600 * 1000
-    : now.getTime() - 5 * 3600 * 1000;
-  const weeklyWindowStart = weeklyResetAt
-    ? weeklyResetAt.getTime() - 7 * 24 * 3600 * 1000
-    : now.getTime() - 7 * 24 * 3600 * 1000;
-
-  const defaultModel = readDefaultAntigravityModel();
-  const files = collectGeminiLogFiles(monthStart);
-  const live = new Set();
-
-  for (const { file, size, ino, format } of files) {
-    live.add(file);
-    let cur = geminiCursors.get(file);
-
-    if (cur && (size < cur.offset || (ino && cur.inode && ino !== cur.inode))) {
-      for (const id of cur.seen) geminiSeenGlobal.delete(id);
-      cur = undefined;
+  syncFiles(gemini, collectGeminiLogFiles(periods.month), periods.month, ({ file, size, format, defaultModel }, cur) => {
+    if (format === 'json') {
+      ingestGeminiJsonFile(cur, file, periods.month);
+      return size;
     }
-    if (!cur) {
-      cur = { offset: 0, inode: ino, days: {}, events: [], seen: new Set(), activeModel: defaultModel };
-      geminiCursors.set(file, cur);
-    }
+    return readNewLines(file, cur.offset, size, GEMINI_NEEDLES, (line) => ingestGeminiLine(cur, file, line, periods.month, defaultModel));
+  });
 
-    if (size > cur.offset) {
-      if (format === 'json') {
-        ingestGeminiJsonFile(file, cur, monthStartMs);
-        cur.offset = size;
-      } else {
-        try {
-          cur.offset = readNewLines(file, cur.offset, size, (line) => {
-            ingestGeminiLine(line, cur, file, monthStartMs, defaultModel);
-          });
-        } catch {}
-      }
-    }
-
-    pruneOld(cur, monthStartMs);
-  }
-
-  for (const [file, cur] of geminiCursors) {
-    if (live.has(file)) continue;
-    for (const id of cur.seen) geminiSeenGlobal.delete(id);
-    geminiCursors.delete(file);
-  }
-
-  const todayKey = dayKey(now);
-  const bounds = { todayKey, todayStart, weekStart, monthStartMs };
-  for (const cur of geminiCursors.values()) {
-    for (const [key, bucket] of Object.entries(cur.days)) {
-      accumulateDayBucket(summary, key, bucket, bounds);
-    }
-
-    if (sessionWindowStart != null) {
-      for (let i = lowerBound(cur.events, sessionWindowStart); i < cur.events.length; i++) {
-        const e = cur.events[i];
-        addBucket(summary.sessionUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
-      }
-    }
-    if (weeklyWindowStart != null) {
-      for (let i = lowerBound(cur.events, weeklyWindowStart); i < cur.events.length; i++) {
-        const e = cur.events[i];
-        addBucket(summary.weeklyUsage, e.input, e.output, e.cacheRead, e.cacheWrite);
-      }
-    }
-  }
-
-  return summary;
+  // Without a reported reset time, use the last 5 hours.
+  const sessionStart = (sessionResetAt ? sessionResetAt.getTime() : now.getTime()) - SESSION_MS;
+  return summarize(gemini, periods, sessionStart);
 }
 
-module.exports = { parseLocalLogs, parseGeminiLocalLogs, bucketTotal, resetCache };
+async function parseAllLogs({ sessionResetAt = null, geminiSessionResetAt = null } = {}) {
+  return {
+    claude: await parseLocalLogs({ sessionResetAt }),
+    gemini: await parseGeminiLocalLogs({ sessionResetAt: geminiSessionResetAt }),
+  };
+}
+
+module.exports = { parseAllLogs, parseLocalLogs, parseGeminiLocalLogs, resetCache };
