@@ -55,7 +55,7 @@ const GEMINI_CRED_ERROR_COPY = {
   [REASON.NOT_FOUND]:         'No Gemini credentials found. Sign into Gemini CLI or Antigravity, or set GEMINI_API_KEY.',
   [REASON.UNREADABLE]:        'Gemini credentials file exists but couldn’t be read.',
   [REASON.MALFORMED]:         'Gemini credentials file is unreadable or corrupt.',
-  [REASON.EXPIRED]:           'Gemini token expired. Open Gemini CLI or Antigravity to sign in again.',
+  [REASON.EXPIRED]:           'Gemini token expired. Open Antigravity or Gemini CLI to refresh it.',
   [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied for Gemini credentials.',
   [REASON.PERMISSION_DENIED]: 'Permission denied reading Gemini credentials file.',
 };

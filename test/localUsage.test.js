@@ -24,7 +24,7 @@ const FILE = path.join(dir, 's.jsonl');
 
 const { parseLocalLogs, parseGeminiLocalLogs, parseAllLogs, resetCache } = require('../src/localUsage');
 const { displayName, tier, cost } = require('../src/pricing');
-const { parseGeminiOAuthPayload } = require('../src/credentials');
+const { parseGeminiOAuthPayload, readGeminiCredentials } = require('../src/credentials');
 const { snapshotForRenderer, combinedWorstPercent, geminiLimits } = require('../src/derivations');
 
 let n = 0;
@@ -391,6 +391,48 @@ function check(name, fn) {
     }));
     assert.strictEqual(flat.accessToken, 'ya29.flat');
   });
+
+  // --- Gemini token choice ------------------------------------------------
+  const savedEnv = {};
+  for (const k of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_OAUTH_CLIENT_ID', 'GEMINI_OAUTH_CLIENT_SECRET']) {
+    savedEnv[k] = process.env[k];
+    delete process.env[k];
+  }
+  const tokenFile = (rel, expiresAt) => {
+    const p = path.join(TMP, '.gemini', rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify({ token: { access_token: 'at-' + rel, refresh_token: 'rt', expiry: new Date(expiresAt).toISOString() } }));
+  };
+  const readGem = () => readGeminiCredentials({ useKeychain: false });
+
+  tokenFile('jetski-standalone-oauth-token', Date.now() - 3_600_000);
+  tokenFile('antigravity-cli/antigravity-oauth-token', Date.now() + 3_600_000);
+  const fresher = await readGem();
+  check('the newest Gemini token on disk wins, whichever app wrote it', () => {
+    assert.strictEqual(fresher.ok, true);
+    assert.strictEqual(fresher.oauth.accessToken, 'at-antigravity-cli/antigravity-oauth-token');
+  });
+
+  tokenFile('antigravity-cli/antigravity-oauth-token', Date.now() - 7_200_000);
+  const lapsed = await readGem();
+  check('an expired token with no known client reads as expired, not as a refresh job', () => {
+    assert.strictEqual(lapsed.ok, false);
+    assert.strictEqual(lapsed.reason, 'expired');
+  });
+
+  process.env.GEMINI_OAUTH_CLIENT_ID = 'my-client';
+  process.env.GEMINI_OAUTH_CLIENT_SECRET = 'my-secret';
+  const renewable = await readGem();
+  check('a client the user supplies makes an expired token renewable', () => {
+    assert.strictEqual(renewable.ok, true);
+    assert.strictEqual(renewable.oauth.needsRefresh, true);
+  });
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  fs.rmSync(path.join(TMP, '.gemini', 'jetski-standalone-oauth-token'));
+  fs.rmSync(path.join(TMP, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'));
 
   check('snapshotForRenderer computes gemini and combined metrics', () => {
     const state = {

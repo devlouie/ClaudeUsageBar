@@ -67,7 +67,7 @@ Local spend numbers are estimates. They are shown with a tilde and dimmer stylin
 
 | Data | Where it goes |
 |---|---|
-| OAuth tokens and API keys | Read from your existing local Claude Code and Gemini credentials. Never stored or copied elsewhere. An expired Gemini token is renewed with Google at `oauth2.googleapis.com`. |
+| OAuth tokens and API keys | Read from your existing local Claude Code and Gemini credentials. Never stored or copied elsewhere. The app never renews a Claude token. It renews a Google token only with a client you supply (see below). |
 | Token and cost totals | Computed locally from your transcripts. Never sent anywhere. |
 | Usage requests | Sent directly to `api.anthropic.com` and `cloudcode-pa.googleapis.com` / `generativelanguage.googleapis.com` with your existing credentials. |
 
@@ -80,6 +80,8 @@ No telemetry. No analytics. No third-party network calls.
 | Claude Code | macOS | Keychain item `Claude Code-credentials`, via `/usr/bin/security` |
 | Claude Code | Linux / Windows | `~/.claude/.credentials.json`, with fallbacks under `~/.config/claude/` and `%APPDATA%\claude\` |
 | Gemini / Antigravity | macOS / Linux / Windows | `~/.gemini/jetski-standalone-oauth-token`, `~/.gemini/antigravity-cli/antigravity-oauth-token`, `~/.gemini/oauth_creds.json`, macOS Keychain `gemini-cli-oauth`, and optional `GEMINI_API_KEY` / `GOOGLE_API_KEY` (`~/.gemini/.env`, `~/.gemini/api_key`, Keychain `gemini-cli-api-key`) |
+
+The app ships no OAuth client of its own, and it identifies itself as ClaudeUsageBar. Antigravity and Gemini CLI renew their Google tokens while they run, and the app reads the newest token on disk. When every token has expired, the Gemini tab says so until one of those apps runs again. To let the app renew a token itself, set `GEMINI_OAUTH_CLIENT_ID` and `GEMINI_OAUTH_CLIENT_SECRET` to the client that issued it. A token file that names its own client works too.
 
 If no credentials are found the popup says so. Sign into Claude Code or Gemini CLI / Antigravity, then click **Re-check**. macOS may ask once for keychain access. Click **Always Allow**. If you deny it, the app does not ask again until you click **Re-check**.
 

@@ -129,9 +129,13 @@ function createPoller({
     // A locked keychain prompts the user on every read. Only retry when asked.
     const shouldRead = (missing, credError) =>
       forceSource || (missing && (manual || credError?.reason !== REASON.LOCKED_KEYCHAIN));
+    // A Gemini token past its expiry that the app cannot renew is as good as
+    // missing. Antigravity or Gemini CLI may have written a new one since.
+    const gem = getGeminiCreds();
+    const gemExpired = Boolean(gem?.oauth?.expiresAt < Date.now() && !gem.oauth.needsRefresh);
     await Promise.all([
       shouldRead(!getToken(), state.credentialError) ? loadCredentials() : null,
-      shouldRead(!getGeminiCreds()?.ok, state.geminiCredentialError) ? loadGeminiCredentials() : null,
+      shouldRead(!gem?.ok || gemExpired, state.geminiCredentialError) ? loadGeminiCredentials() : null,
     ]);
 
     const hasClaude = Boolean(getToken());
@@ -154,12 +158,12 @@ function createPoller({
     const resetsBefore = resetKey();
     const [apiResult, geminiResult] = await Promise.all([
       hasClaude ? fetchClaude() : null,
-      hasGemini ? fetchGeminiUsage(gemCreds) : null,
+      hasGemini ? fetchGemini(gemCreds) : null,
       refreshLocal(),
     ]);
 
     if (apiResult) handleApiResult(apiResult);
-    if (geminiResult) await handleGeminiResult(geminiResult);
+    if (geminiResult) handleGeminiResult(geminiResult);
     updateThrottle(apiResult || geminiResult);
 
     // Session totals are measured from the reset time, so a new one means
@@ -179,6 +183,16 @@ function createPoller({
     return next && next !== previous ? fetchUsage(next) : first;
   }
 
+  // Same for Gemini: a rejected token may have been replaced on disk.
+  async function fetchGemini(creds) {
+    const first = await fetchGeminiUsage(creds);
+    if (first.status !== 401 && first.status !== 403) return first;
+    await loadGeminiCredentials();
+    const next = getGeminiCreds();
+    const replaced = next?.ok && next.oauth?.accessToken && next.oauth.accessToken !== creds.oauth?.accessToken;
+    return replaced ? fetchGeminiUsage(next) : first;
+  }
+
   function handleApiResult(result) {
     if (result.ok) {
       state.usage = result.data;
@@ -193,7 +207,7 @@ function createPoller({
     }
   }
 
-  async function handleGeminiResult(result) {
+  function handleGeminiResult(result) {
     if (result.refreshedOauth) {
       const prev = getGeminiCreds();
       if (prev) setGeminiCreds({ ...prev, oauth: result.refreshedOauth });
@@ -204,8 +218,10 @@ function createPoller({
       state.geminiLastUpdated = new Date();
       state.geminiErrorMessage = null;
     } else if (result.status === 401 || result.status === 403) {
-      await loadGeminiCredentials();
-      state.geminiErrorMessage = 'Gemini token expired or unauthorized. Sign in again.';
+      // A failed re-read has already set the more specific message.
+      if (!state.geminiCredentialError) {
+        state.geminiErrorMessage = 'Gemini token rejected. Open Antigravity or Gemini CLI to sign in again.';
+      }
     } else {
       state.geminiErrorMessage = describeFailure(result, 'Gemini');
     }

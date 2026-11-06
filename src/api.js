@@ -1,5 +1,6 @@
 const https = require('https');
 const { version } = require('../package.json');
+const { geminiOAuthClient } = require('./credentials');
 
 const USER_AGENT = `ClaudeUsageBar/${version}`;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -106,92 +107,40 @@ function fetchUsage(accessToken) {
 // Gemini Subscription (Code Assist / Antigravity) & API Key Telemetry
 // ---------------------------------------------------------------------------
 
-// Public installed-app OAuth client parameters used by Antigravity (Jetski)
-// and Gemini CLI to exchange a local refresh_token for an access_token.
-// Assembled at runtime so static regex scanners don't mistake public native-app
-// client identifiers for server-side secrets.
-const OAUTH_ID_DOMAIN = ['apps', 'googleusercontent', 'com'].join('.');
-const OAUTH_CS_PREFIX = ['GOC', 'SPX'].join('') + '-';
-const GEMINI_OAUTH_CLIENTS = {
-  jetski: [
-    {
-      clientId: ['REDACTED', 'REDACTED'].join('-') + '.' + OAUTH_ID_DOMAIN,
-      clientSecret: OAUTH_CS_PREFIX + ['REDACTED', 'REDACTED'].join(''),
-    },
-    {
-      clientId: ['REDACTED', 'REDACTED'].join('-') + '.' + OAUTH_ID_DOMAIN,
-      clientSecret: OAUTH_CS_PREFIX + ['REDACTED', 'REDACTED'].join(''),
-    },
-  ],
-  'gemini-cli': [
-    {
-      clientId: ['REDACTED', 'REDACTED'].join('-') + '.' + OAUTH_ID_DOMAIN,
-      clientSecret: OAUTH_CS_PREFIX + ['REDACTED', 'REDACTED'].join(''),
-    },
-  ],
-};
-
-function getPlatformEnum() {
-  if (process.platform === 'darwin') {
-    return process.arch === 'arm64' ? 'DARWIN_ARM64' : 'DARWIN_AMD64';
-  }
-  if (process.platform === 'linux') {
-    return process.arch === 'arm64' ? 'LINUX_ARM64' : 'LINUX_AMD64';
-  }
-  if (process.platform === 'win32') return 'WINDOWS_AMD64';
-  return 'PLATFORM_UNSPECIFIED';
-}
+// The app identifies as itself. These are the generic values for a client
+// that names no IDE.
+const CODE_ASSIST_METADATA = { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' };
 
 function postJson(hostname, path, body, headers = {}) {
   return request({ hostname, path, method: 'POST', body: body || {}, headers });
 }
 
+// Renews a Google access token. The app ships no OAuth client of its own, so
+// this works only when the token file or the environment names the client
+// that issued the token. Otherwise Antigravity and Gemini CLI keep their tokens
+// fresh while they run, and the app reads the new one from disk.
 async function refreshGeminiAccessToken(oauth) {
-  if (!oauth || !oauth.refreshToken) return null;
-  const customId = oauth.clientId || process.env.GEMINI_OAUTH_CLIENT_ID || null;
-  const customSecret = oauth.clientSecret || process.env.GEMINI_OAUTH_CLIENT_SECRET || null;
-  const candidates = [
-    ...(customId && customSecret ? [{ clientId: customId, clientSecret: customSecret }] : []),
-    ...(GEMINI_OAUTH_CLIENTS[oauth.clientType] || []),
-    ...GEMINI_OAUTH_CLIENTS.jetski,
-    ...GEMINI_OAUTH_CLIENTS['gemini-cli'],
-  ];
-
-  for (const { clientId, clientSecret } of candidates) {
-    const res = await postJson('oauth2.googleapis.com', '/token', {
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: oauth.refreshToken,
-      grant_type: 'refresh_token',
-    });
-    if (res.ok && res.data && res.data.access_token) {
-      const expiresInSec = Number(res.data.expires_in) || 3600;
-      return {
-        ...oauth,
-        accessToken: res.data.access_token,
-        expiresAt: Date.now() + expiresInSec * 1000,
-        needsRefresh: false,
-      };
-    }
-  }
-  return null;
+  const client = oauth?.refreshToken ? geminiOAuthClient(oauth) : null;
+  if (!client) return null;
+  const res = await postJson('oauth2.googleapis.com', '/token', {
+    client_id: client.clientId,
+    client_secret: client.clientSecret,
+    refresh_token: oauth.refreshToken,
+    grant_type: 'refresh_token',
+  });
+  if (!res.ok || !res.data?.access_token) return null;
+  const expiresInSec = Number(res.data.expires_in) || 3600;
+  return {
+    ...oauth,
+    accessToken: res.data.access_token,
+    expiresAt: Date.now() + expiresInSec * 1000,
+    needsRefresh: false,
+  };
 }
 
 async function fetchCodeAssistHost(hostname, accessToken) {
-  const headers = {
-    Authorization: `Bearer ${accessToken}`,
-    'User-Agent': `antigravity/2.24.0 (${process.platform}/${process.arch})`,
-  };
-  const loadRes = await postJson(hostname, '/v1internal:loadCodeAssist', {
-    metadata: {
-      ideType: 'ANTIGRAVITY',
-      ideName: 'antigravity',
-      ideVersion: '2.24.0',
-      platform: getPlatformEnum(),
-      pluginType: 'GEMINI',
-    },
-  }, headers);
-
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  const loadRes = await postJson(hostname, '/v1internal:loadCodeAssist', { metadata: CODE_ASSIST_METADATA }, headers);
   if (!loadRes.ok) return loadRes;
 
   const project = loadRes.data?.cloudaicompanionProject || process.env.GOOGLE_CLOUD_PROJECT || '';
@@ -371,48 +320,33 @@ function mergeGeminiHostResults(results, apiKeyProbe) {
 async function fetchGeminiUsage({ oauth, apiKey } = {}) {
   let activeOauth = oauth || null;
   let refreshedOauth = null;
-  let triedRefresh = false;
 
-  if (activeOauth) {
-    const soonExpired = activeOauth.expiresAt && activeOauth.expiresAt < Date.now() + 60_000;
-    if ((activeOauth.needsRefresh || soonExpired || !activeOauth.accessToken) && activeOauth.refreshToken) {
-      triedRefresh = true;
-      const fresh = await refreshGeminiAccessToken(activeOauth);
-      if (fresh) {
-        activeOauth = fresh;
-        refreshedOauth = fresh;
-      }
-    }
+  const stale = Boolean(activeOauth && (activeOauth.needsRefresh || !activeOauth.accessToken
+    || (activeOauth.expiresAt && activeOauth.expiresAt < Date.now() + 60_000)));
+  if (stale) {
+    const fresh = await refreshGeminiAccessToken(activeOauth);
+    if (fresh) activeOauth = refreshedOauth = fresh;
   }
 
   const customHost = (process.env.GEMINI_CLOUD_CODE_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   const hosts = customHost
     ? [customHost]
     : ['daily-cloudcode-pa.googleapis.com', 'cloudcode-pa.googleapis.com'];
+  const fetchHosts = (token) => Promise.all(hosts.map((h) => fetchCodeAssistHost(h, token)));
 
-  const tasks = [];
-  if (activeOauth && activeOauth.accessToken) {
-    tasks.push(Promise.all(hosts.map((h) => fetchCodeAssistHost(h, activeOauth.accessToken))));
-  } else {
-    tasks.push(Promise.resolve([]));
-  }
+  let [hostResults, apiKeyProbe] = await Promise.all([
+    activeOauth?.accessToken ? fetchHosts(activeOauth.accessToken) : [],
+    apiKey ? probeGeminiApiKey(apiKey) : null,
+  ]);
 
-  if (apiKey) {
-    tasks.push(probeGeminiApiKey(apiKey));
-  } else {
-    tasks.push(Promise.resolve(null));
-  }
-
-  let [hostResults, apiKeyProbe] = await Promise.all(tasks);
-
-  // If OAuth returned 401/403 and we haven't tried the refresh token yet, refresh and retry once.
+  // A token rejected before its stated expiry gets one refresh and retry, when
+  // a refresh is possible at all.
   const allAuthFailed = hostResults.length > 0 && hostResults.every((r) => !r.ok && (r.status === 401 || r.status === 403));
-  if (allAuthFailed && activeOauth?.refreshToken && !triedRefresh) {
+  if (allAuthFailed && !stale) {
     const fresh = await refreshGeminiAccessToken(activeOauth);
-    if (fresh && fresh.accessToken) {
-      activeOauth = fresh;
-      refreshedOauth = fresh;
-      hostResults = await Promise.all(hosts.map((h) => fetchCodeAssistHost(h, activeOauth.accessToken)));
+    if (fresh) {
+      activeOauth = refreshedOauth = fresh;
+      hostResults = await fetchHosts(fresh.accessToken);
     }
   }
 
@@ -421,4 +355,5 @@ async function fetchGeminiUsage({ oauth, apiKey } = {}) {
   return merged;
 }
 
-module.exports = { request, fetchUsage, fetchGeminiUsage };
+module.exports = { request, fetchUsage, fetchGeminiUsage, refreshGeminiAccessToken };
+

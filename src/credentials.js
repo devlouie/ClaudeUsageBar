@@ -163,7 +163,16 @@ function parseCredentialPayload(raw) {
 // Gemini credentials (OAuth via Antigravity / Gemini CLI + Gemini API Key)
 // ---------------------------------------------------------------------------
 
-async function readGeminiCredentials() {
+// A Google refresh needs the OAuth client that issued the token. The app ships
+// none, so it uses one only when the token file names it or the user sets
+// GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET.
+function geminiOAuthClient(oauth) {
+  const clientId = oauth?.clientId || process.env.GEMINI_OAUTH_CLIENT_ID || null;
+  const clientSecret = oauth?.clientSecret || process.env.GEMINI_OAUTH_CLIENT_SECRET || null;
+  return clientId && clientSecret ? { clientId, clientSecret } : null;
+}
+
+async function readGeminiCredentials({ useKeychain = process.platform === 'darwin' } = {}) {
   const pathsTried = [];
   let oauth = null;
   let oauthReason = REASON.NOT_FOUND;
@@ -175,7 +184,7 @@ async function readGeminiCredentials() {
     oauth = fileRes.oauth;
   } else {
     oauthReason = fileRes.reason || REASON.NOT_FOUND;
-    if (process.platform === 'darwin') {
+    if (useKeychain) {
       const km = await readGeminiMacKeychain();
       pathsTried.push(km.diag);
       if (km.ok) {
@@ -186,20 +195,19 @@ async function readGeminiCredentials() {
     }
   }
 
-  // Check expiry on OAuth token. If a refreshToken is available, mark
-  // needsRefresh=true rather than failing so api.js can mint a fresh token.
-  if (oauth) {
-    const expired = oauth.expiresAt && Number.isFinite(oauth.expiresAt) && oauth.expiresAt < Date.now();
-    if (expired && !oauth.refreshToken) {
+  // An expired token is only usable if api.js can renew it. Otherwise report it
+  // as expired, so the popup says to open Antigravity or Gemini CLI.
+  if (oauth && Number.isFinite(oauth.expiresAt) && oauth.expiresAt < Date.now()) {
+    if (oauth.refreshToken && geminiOAuthClient(oauth)) {
+      oauth.needsRefresh = true;
+    } else {
       oauth = null;
       oauthReason = REASON.EXPIRED;
-    } else if (expired) {
-      oauth.needsRefresh = true;
     }
   }
 
   // 2. Check Gemini API Key (env vars, keychain, ~/.gemini/.env, ~/.gemini/api_key)
-  const apiKey = await readGeminiApiKey(pathsTried);
+  const apiKey = await readGeminiApiKey(pathsTried, { useKeychain });
 
   if (oauth || apiKey) {
     return {
@@ -220,25 +228,25 @@ async function readGeminiCredentials() {
   };
 }
 
+// Antigravity, its CLI, and Gemini CLI each keep a token file. Whichever app
+// ran last has the freshest one, so read them all and take the latest expiry.
 function readGeminiOAuthFiles(pathsTried) {
   const home = os.homedir();
   const candidates = [
-    { path: path.join(home, '.gemini', 'jetski-standalone-oauth-token'), clientType: 'jetski' },
-    { path: path.join(home, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), clientType: 'jetski' },
-    { path: path.join(home, '.gemini', 'oauth_creds.json'), clientType: 'gemini-cli' },
-    { path: path.join(home, '.config', 'gemini', 'oauth_creds.json'), clientType: 'gemini-cli' },
+    path.join(home, '.gemini', 'jetski-standalone-oauth-token'),
+    path.join(home, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
+    path.join(home, '.gemini', 'oauth_creds.json'),
+    path.join(home, '.config', 'gemini', 'oauth_creds.json'),
   ];
   if (process.platform === 'win32' && process.env.APPDATA) {
-    candidates.push({
-      path: path.join(process.env.APPDATA, 'gemini', 'oauth_creds.json'),
-      clientType: 'gemini-cli',
-    });
+    candidates.push(path.join(process.env.APPDATA, 'gemini', 'oauth_creds.json'));
   }
 
   let sawAny = false;
   let lastReason = REASON.NOT_FOUND;
+  let best = null;
 
-  for (const { path: p, clientType } of candidates) {
+  for (const p of candidates) {
     let exists;
     try { exists = fs.existsSync(p); } catch { exists = false; }
     if (!exists) {
@@ -254,16 +262,19 @@ function readGeminiOAuthFiles(pathsTried) {
       lastReason = e.code === 'EACCES' ? REASON.PERMISSION_DENIED : REASON.UNREADABLE;
       continue;
     }
-    const parsed = parseGeminiOAuthPayload(raw, clientType, p);
+    const parsed = parseGeminiOAuthPayload(raw, p);
     if (!parsed) {
       pathsTried.push({ source: p, status: 'malformed' });
       lastReason = REASON.MALFORMED;
       continue;
     }
     pathsTried.push({ source: p, status: 'ok' });
-    return { ok: true, oauth: parsed };
+    // A token that states no expiry makes no claim, so it counts as current.
+    const expiry = (o) => o.expiresAt ?? Infinity;
+    if (!best || expiry(parsed) > expiry(best)) best = parsed;
   }
 
+  if (best) return { ok: true, oauth: best };
   return { ok: false, reason: sawAny ? lastReason : REASON.NOT_FOUND };
 }
 
@@ -273,12 +284,12 @@ async function readGeminiMacKeychain() {
   if (item.status !== 'ok') {
     return { ok: false, diag: { source, status: item.status, ...(item.detail ? { detail: item.detail } : {}) } };
   }
-  const oauth = parseGeminiOAuthPayload(item.value, 'gemini-cli', source);
+  const oauth = parseGeminiOAuthPayload(item.value, source);
   if (!oauth) return { ok: false, diag: { source, status: 'malformed' } };
   return { ok: true, oauth, diag: { source, status: 'ok' } };
 }
 
-function parseGeminiOAuthPayload(raw, defaultClientType = 'gemini-cli', sourcePath = null) {
+function parseGeminiOAuthPayload(raw, sourcePath = null) {
   try {
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return null;
@@ -309,7 +320,6 @@ function parseGeminiOAuthPayload(raw, defaultClientType = 'gemini-cli', sourcePa
       expiresAt,
       tokenType: tok.token_type || tok.tokenType || 'Bearer',
       authMethod: data.auth_method || data.authMethod || 'oauth',
-      clientType: defaultClientType,
       sourcePath,
     };
   } catch {
@@ -317,14 +327,14 @@ function parseGeminiOAuthPayload(raw, defaultClientType = 'gemini-cli', sourcePa
   }
 }
 
-async function readGeminiApiKey(pathsTried) {
+async function readGeminiApiKey(pathsTried, { useKeychain }) {
   const envKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
   if (envKey) {
     pathsTried.push({ source: 'env:GEMINI_API_KEY', status: 'ok' });
     return envKey;
   }
 
-  if (process.platform === 'darwin') {
+  if (useKeychain) {
     const source = 'keychain:gemini-cli-api-key';
     const item = await readKeychainItem('gemini-cli-api-key');
     if (item.status === 'ok' && item.value) {
@@ -382,5 +392,6 @@ module.exports = {
   readCredentials,
   readGeminiCredentials,
   parseGeminiOAuthPayload,
+  geminiOAuthClient,
   REASON,
 };

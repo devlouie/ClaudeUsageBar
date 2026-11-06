@@ -7,7 +7,9 @@
 const assert = require('assert');
 const http = require('http');
 
-const { request } = require('../src/api');
+const fs = require('fs');
+const path = require('path');
+const { request, refreshGeminiAccessToken } = require('../src/api');
 const { createPoller } = require('../src/poller');
 const { REASON } = require('../src/credentials');
 const { snapshotForRenderer, claudeLimits, geminiLimits, combinedWorstPercent, sessionPercent } = require('../src/derivations');
@@ -361,6 +363,59 @@ async function withClock(fn) {
     assert.strictEqual(gemCalls, 1);
     assert.strictEqual(state.geminiUsage.five_hour.utilization, 3);
     assert.ok(state.geminiLastUpdated);
+  });
+
+  await check('a rejected Gemini token is re-read from disk and retried', async () => {
+    const tokens = [];
+    let gem = { ok: true, oauth: { accessToken: 'old' } };
+    const { state, poller } = harness({
+      getGeminiCreds: () => gem,
+      loadGeminiCredentials: async () => { gem = { ok: true, oauth: { accessToken: 'new' } }; },
+      fetchGeminiUsage: async (c) => {
+        tokens.push(c.oauth.accessToken);
+        return c.oauth.accessToken === 'old' ? { ok: false, status: 401 } : { ok: true, data: { five_hour: { utilization: 2 } } };
+      },
+    });
+    await poller.refresh({ manual: true });
+    poller.stop();
+    assert.deepStrictEqual(tokens, ['old', 'new']);
+    assert.strictEqual(state.geminiErrorMessage, null);
+  });
+
+  await check('an expired Gemini token is re-read before it is sent', async () => {
+    let loads = 0;
+    const gem = { ok: true, oauth: { accessToken: 'g', expiresAt: Date.now() - 1000 } };
+    const { poller } = harness({
+      getGeminiCreds: () => gem,
+      loadGeminiCredentials: async () => { loads++; },
+      fetchGeminiUsage: async () => ({ ok: true, data: {} }),
+    });
+    await poller.refresh();
+    poller.stop();
+    assert.strictEqual(loads, 1);
+  });
+
+  // --- Gemini sign-in conduct ---------------------------------------------
+  await check('no Google token refresh without a client the user supplies', async () => {
+    const saved = [process.env.GEMINI_OAUTH_CLIENT_ID, process.env.GEMINI_OAUTH_CLIENT_SECRET];
+    delete process.env.GEMINI_OAUTH_CLIENT_ID;
+    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
+    try {
+      assert.strictEqual(await refreshGeminiAccessToken({ accessToken: 'a', refreshToken: 'r' }), null);
+    } finally {
+      if (saved[0] !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = saved[0];
+      if (saved[1] !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = saved[1];
+    }
+  });
+
+  await check('the source ships no OAuth client secrets and no borrowed identity', () => {
+    const dir = path.join(__dirname, '..', 'src');
+    for (const name of fs.readdirSync(dir)) {
+      const text = fs.readFileSync(path.join(dir, name), 'utf8');
+      for (const bad of [/GOCSPX/, /'GOC'/, /googleusercontent/, /\.join\('-'\) \+ '\.'/, /ideType: 'ANTIGRAVITY'/, /antigravity\/\d/]) {
+        assert.ok(!bad.test(text), `${name} matches ${bad}`);
+      }
+    }
   });
 
   // --- Derived numbers ----------------------------------------------------

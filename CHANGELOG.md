@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Gemini sign-in
+
+- The app no longer ships Google OAuth client secrets or presents itself as Antigravity. It identifies as ClaudeUsageBar.
+- It reads the newest token that Antigravity or Gemini CLI has saved. When every token has expired, the Gemini tab says to open one of those apps. Set `GEMINI_OAUTH_CLIENT_ID` and `GEMINI_OAUTH_CLIENT_SECRET` to let the app renew tokens itself.
+
 Accuracy
 
 - 7d and 30d are now rolling windows. They used to stop at Monday and the 1st of the month, so early in a month "30d" showed a few days and the daily chart was empty.
@@ -37,7 +42,7 @@ Internals
 - The popup renderer is now sandboxed and cannot navigate or open windows. Removed an unused IPC channel.
 - The tray icon is drawn in code, which removes a hidden browser window.
 - Shared code replaced the duplicated Claude and Gemini paths in the parser and the derivations, and the three HTTP clients.
-- 111 regression checks under `npm test`.
+- 118 regression checks under `npm test`.
 
 ## 2.2.0
 
